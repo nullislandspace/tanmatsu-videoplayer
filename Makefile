@@ -1,4 +1,5 @@
 PORT ?= /dev/ttyACM0
+BADGELINKPORT ?= $(PORT)
 
 IDF_PATH ?= $(shell cat .IDF_PATH 2>/dev/null || echo `pwd`/esp-idf)
 IDF_TOOLS_PATH ?= $(shell cat .IDF_TOOLS_PATH 2>/dev/null || echo `pwd`/esp-idf-tools)
@@ -56,14 +57,17 @@ badgelink:
 	git clone https://github.com/badgeteam/esp32-component-badgelink.git badgelink
 	cd badgelink/tools; ./install.sh
 
+# Determine badgelink connection argument: --tcp for host:port, --port for serial devices
+BADGELINK_CONN := $(if $(findstring :,$(BADGELINKPORT)),--tcp $(BADGELINKPORT),--port $(BADGELINKPORT))
+
 .PHONY: install
 install: build
 install:
-	cd badgelink/tools; ./badgelink.sh appfs upload application "template application" 0 ../../$(BUILD)/application.bin
+	cd badgelink/tools; ./badgelink.sh $(BADGELINK_CONN) appfs upload application "video player" 0 ../../$(BUILD)/application.bin
 
 .PHONY: run
 run:
-	cd badgelink/tools; ./badgelink.sh start application
+	cd badgelink/tools; ./badgelink.sh $(BADGELINK_CONN) start application
 
 # Preparation
 

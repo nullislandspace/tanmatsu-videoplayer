@@ -1,20 +1,24 @@
-idf_build_get_property(idf_target IDF_TARGET)
-if("${idf_target}" STREQUAL "esp32p4")
-list(APPEND extra_requires esp-hosted-tanmatsu)
-endif()
-
-
 idf_component_register(
 	SRCS
 		"main.c"
+		"file_browser.c"
+		"mjpeg_decoder.c"
+		"avi_parser.c"
+		"audio_player.c"
+		"usb_device.c"
+		"sdcard.c"
+		"fastopen.c"
 	PRIV_REQUIRES
 		esp_lcd
-		fatfs
-		nvs_flash
-		bt
 		badge-bsp
-		tanmatsu-wifi
-		${extra_requires}
+		fatfs
+		sdmmc
+		esp_driver_sdmmc
+		esp_driver_sdspi
+		esp_driver_spi
+		esp_driver_i2s
+		esp_driver_jpeg
+		vfs
 	INCLUDE_DIRS
 		"."
 )
