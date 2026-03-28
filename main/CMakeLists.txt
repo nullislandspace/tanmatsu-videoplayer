@@ -3,6 +3,8 @@ idf_component_register(
 		"main.c"
 		"file_browser.c"
 		"mjpeg_decoder.c"
+		"video_decoder.c"
+		"yuv_convert.c"
 		"avi_parser.c"
 		"audio_player.c"
 		"usb_device.c"
@@ -18,6 +20,7 @@ idf_component_register(
 		esp_driver_spi
 		esp_driver_i2s
 		esp_driver_jpeg
+		esp_driver_ppa
 		vfs
 	INCLUDE_DIRS
 		"."

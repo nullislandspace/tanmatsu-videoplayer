@@ -1,5 +1,5 @@
 // Tanmatsu Video Player
-// Plays MJPEG+MP3 AVI files from SD card with file browser, seeking, and headphone detection
+// Plays MJPEG+MP3 and H.264+MP3 AVI files from SD card
 
 #include <stdio.h>
 #include <stdint.h>
@@ -25,6 +25,8 @@
 #include "sdcard.h"
 #include "file_browser.h"
 #include "mjpeg_decoder.h"
+#include "video_decoder.h"
+#include "yuv_convert.h"
 #include "avi_parser.h"
 #include "audio_player.h"
 
@@ -53,6 +55,7 @@ static char error_message[128] = {0};
 
 // Video playback state
 static avi_parser_t avi_parser = {0};
+static avi_codec_t active_codec = AVI_CODEC_UNKNOWN;
 static int current_frame = 0;
 static bool video_ended = false;
 static int video_fps = 20;
@@ -229,12 +232,19 @@ static void update_fps(void) {
     }
 }
 
-static void draw_fps_overlay(uint8_t* fb_pixels, int stride, int height) {
+// Draw FPS inside the video content area so it gets overwritten by the next frame
+static void draw_fps_overlay(uint8_t* fb_pixels, int stride, int height,
+                              int video_width, int video_height) {
     if (!show_fps) return;
     char fps_str[16];
     snprintf(fps_str, sizeof(fps_str), "%.1f fps", current_fps);
     int tw = hershey_string_width(fps_str, 18);
-    hershey_draw_string(fb_pixels, stride, height, 800 - tw - 10, 5, fps_str, 18, 0, 255, 0);
+    // Position in top-right of the video content (centered on screen)
+    int offset_x = (800 - video_width) / 2;
+    int offset_y = (480 - video_height) / 2;
+    int x = offset_x + video_width - tw - 5;
+    int y = offset_y + 5;
+    hershey_draw_string(fb_pixels, stride, height, x, y, fps_str, 18, 0, 255, 0);
 }
 
 // --- Headphone detection ---
@@ -297,30 +307,54 @@ static bool process_video_frame(uint8_t* fb_pixels, int fb_stride, int fb_height
 
     int64_t t0 = esp_timer_get_time();
 
-    // Decode MJPEG frame
-    uint8_t* bgr_out = NULL;
+    // Decode frame based on active codec
     int width = 0, height = 0;
-    esp_err_t ret = mjpeg_decoder_decode(frame_data, frame->size, &bgr_out, &width, &height);
+    esp_err_t ret = ESP_FAIL;
+    bool frame_ready = false;
 
-    video_read_idx = (video_read_idx + 1) % VIDEO_BUFFER_FRAMES;
-    video_buffered--;
+    if (active_codec == AVI_CODEC_MJPEG) {
+        uint8_t* bgr_out = NULL;
+        ret = mjpeg_decoder_decode(frame_data, frame->size, &bgr_out, &width, &height);
+        video_read_idx = (video_read_idx + 1) % VIDEO_BUFFER_FRAMES;
+        video_buffered--;
+        if (ret == ESP_OK && bgr_out) {
+            int64_t t1 = esp_timer_get_time();
+            mjpeg_copy_to_framebuffer(bgr_out, fb_pixels, width, height, 800, 480);
+            timing_decode_us += (t1 - t0);
+            timing_copy_us += (esp_timer_get_time() - t1);
+            frame_ready = true;
+        }
+    } else if (active_codec == AVI_CODEC_H264) {
+        uint8_t* yuv_out = NULL;
+        ret = video_decoder_decode(frame_data, frame->size, &yuv_out, &width, &height);
+        video_read_idx = (video_read_idx + 1) % VIDEO_BUFFER_FRAMES;
+        video_buffered--;
+        if (ret == ESP_OK && yuv_out) {
+            int64_t t1 = esp_timer_get_time();
+            // H.264 decoder may output macroblock-aligned dimensions
+            int aligned_w = (width + 15) & ~15;
+            int aligned_h = (height + 15) & ~15;
+            yuv_to_framebuffer(yuv_out, fb_pixels, aligned_w, aligned_h,
+                               width, height, 800, 480);
+            timing_decode_us += (t1 - t0);
+            timing_copy_us += (esp_timer_get_time() - t1);
+            frame_ready = true;
+        } else if (ret == ESP_ERR_NOT_FINISHED) {
+            // H.264 decoder is buffering, not an error
+        }
+    } else {
+        video_read_idx = (video_read_idx + 1) % VIDEO_BUFFER_FRAMES;
+        video_buffered--;
+    }
 
-    int64_t t1 = esp_timer_get_time();
-
-    if (ret == ESP_OK && bgr_out) {
+    if (frame_ready) {
         current_frame = frame->frame_index + 1;
-
-        mjpeg_copy_to_framebuffer(bgr_out, fb_pixels, width, height, 800, 480);
-
-        int64_t t2 = esp_timer_get_time();
 
         // FPS tracking
         update_fps();
-        draw_fps_overlay(fb_pixels, fb_stride, fb_height);
+        draw_fps_overlay(fb_pixels, fb_stride, fb_height, width, height);
 
-        // Timing stats
-        timing_decode_us += (t1 - t0);
-        timing_copy_us += (t2 - t1);
+        // Timing stats (decode/copy already accumulated in codec branches above)
         timing_frame_count++;
 
         if (timing_frame_count >= 30) {
@@ -360,9 +394,11 @@ static esp_err_t start_playback(const char* path) {
     video_fps = info->fps > 0 ? info->fps : 20;
     frame_duration_ms = 1000 / video_fps;
 
-    ESP_LOGI(TAG, "AVI: %lux%lu @ %d fps, audio=%d, index=%d",
+    const char* codec_name = info->video_codec == AVI_CODEC_MJPEG ? "MJPEG" :
+                              info->video_codec == AVI_CODEC_H264 ? "H.264" : "unknown";
+    ESP_LOGI(TAG, "AVI: %lux%lu @ %d fps, codec=%s, audio=%d, index=%d",
              (unsigned long)info->width, (unsigned long)info->height,
-             video_fps, info->has_audio, avi_parser_can_seek(&avi_parser));
+             video_fps, codec_name, info->has_audio, avi_parser_can_seek(&avi_parser));
 
     // Allocate video buffer
     if (!video_buffer_memory) {
@@ -377,12 +413,34 @@ static esp_err_t start_playback(const char* path) {
 
     reset_buffer_state();
 
-    // Init MJPEG decoder
-    ret = mjpeg_decoder_init(info->width, info->height);
-    if (ret != ESP_OK) {
+    // Init video decoder based on codec
+    active_codec = info->video_codec;
+
+    if (active_codec == AVI_CODEC_MJPEG) {
+        ret = mjpeg_decoder_init(info->width, info->height);
+        if (ret != ESP_OK) {
+            avi_parser_close(&avi_parser);
+            show_error("Failed to init MJPEG decoder");
+            return ret;
+        }
+    } else if (active_codec == AVI_CODEC_H264) {
+        ret = video_decoder_init(info->width, info->height);
+        if (ret != ESP_OK) {
+            avi_parser_close(&avi_parser);
+            show_error("Failed to init H.264 decoder");
+            return ret;
+        }
+        ret = yuv_convert_init();
+        if (ret != ESP_OK) {
+            video_decoder_deinit();
+            avi_parser_close(&avi_parser);
+            show_error("Failed to init YUV converter");
+            return ret;
+        }
+    } else {
         avi_parser_close(&avi_parser);
-        show_error("Failed to init MJPEG decoder");
-        return ret;
+        show_error("Unsupported video codec");
+        return ESP_ERR_NOT_SUPPORTED;
     }
 
     // Start audio
@@ -420,7 +478,13 @@ static esp_err_t start_playback(const char* path) {
 static void stop_playback(void) {
     ESP_LOGI(TAG, "Stopping playback");
     audio_player_stop();
-    mjpeg_decoder_deinit();
+    if (active_codec == AVI_CODEC_MJPEG) {
+        mjpeg_decoder_deinit();
+    } else if (active_codec == AVI_CODEC_H264) {
+        video_decoder_deinit();
+        yuv_convert_deinit();
+    }
+    active_codec = AVI_CODEC_UNKNOWN;
     avi_parser_close(&avi_parser);
     reset_buffer_state();
     paused = false;
@@ -782,6 +846,7 @@ void app_main(void) {
                                  ? pdMS_TO_TICKS(5) : pdMS_TO_TICKS(50);
             xSemaphoreTake(vsync_sem, timeout);
         }
+
         blit();
 
         if (app_state != APP_STATE_PLAYING || paused) {
