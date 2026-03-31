@@ -236,6 +236,7 @@ static esp_err_t parse_idx1(avi_parser_t* parser, size_t idx1_offset, uint32_t i
 
         for (int i = 0; i < batch; i++) {
             uint32_t fourcc = read_u32_le(idx_buf + i * 16);
+            uint32_t flags  = read_u32_le(idx_buf + i * 16 + 4);
             uint32_t offset = read_u32_le(idx_buf + i * 16 + 8);
             uint32_t size   = read_u32_le(idx_buf + i * 16 + 12);
 
@@ -264,6 +265,7 @@ static esp_err_t parse_idx1(avi_parser_t* parser, size_t idx1_offset, uint32_t i
             if (type_hi == 'd' && (type_lo == 'c' || type_lo == 'b') && vi < video_count) {
                 parser->video_index[vi].offset = abs_offset;
                 parser->video_index[vi].size = size;
+                parser->video_index[vi].keyframe = (flags & 0x10) != 0;  // AVIIF_KEYFRAME
                 vi++;
             } else if (type_hi == 'w' && type_lo == 'b' && parser->audio_index && ai < audio_count) {
                 parser->audio_index[ai].offset = abs_offset;
@@ -504,10 +506,15 @@ esp_err_t avi_parser_seek_to_frame(avi_parser_t* parser, int frame_number, int* 
         frame_number = parser->video_index_count - 1;
     }
 
-    // Seek to the chunk header
+    // Seek backward to the nearest keyframe (required for H.264 P-frame decoding)
+    int keyframe = frame_number;
+    while (keyframe > 0 && !parser->video_index[keyframe].keyframe) {
+        keyframe--;
+    }
+
     // Flush stdio buffer before large seek to ensure DMA buffer consistency
     fflush(parser->file);
-    parser->current_pos = parser->video_index[frame_number].offset;
+    parser->current_pos = parser->video_index[keyframe].offset;
 
     if (audio_index_out) {
         *audio_index_out = -1;
@@ -528,8 +535,8 @@ esp_err_t avi_parser_seek_to_frame(avi_parser_t* parser, int frame_number, int* 
         }
     }
 
-    ESP_LOGI(TAG, "Seeked to frame %d (offset=%lu)",
-             frame_number, (unsigned long)parser->video_index[frame_number].offset);
+    ESP_LOGI(TAG, "Seeked to keyframe %d (requested %d, offset=%lu)",
+             keyframe, frame_number, (unsigned long)parser->video_index[keyframe].offset);
 
     return ESP_OK;
 }

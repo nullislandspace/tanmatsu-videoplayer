@@ -48,6 +48,7 @@ typedef struct {
 typedef struct {
     uint32_t offset;    // Absolute file offset of chunk data (after 8-byte header)
     uint32_t size;      // Chunk data size
+    bool keyframe;      // True if this is a keyframe (I-frame)
 } avi_index_entry_t;
 
 // AVI parser state (for streaming from file)
