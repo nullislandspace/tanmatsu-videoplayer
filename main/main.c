@@ -581,7 +581,11 @@ void app_main(void) {
         default: break;
     }
 
-    pax_buf_init(&fb, NULL, display_h_res, display_v_res, format);
+    // Allocate 64-byte aligned framebuffer so PPA can write to it directly
+    size_t fb_size = display_h_res * display_v_res * (format == PAX_BUF_16_565RGB ? 2 : 3);
+    void* fb_mem = heap_caps_aligned_alloc(64, fb_size, MALLOC_CAP_SPIRAM);
+    assert(fb_mem);
+    pax_buf_init(&fb, fb_mem, display_h_res, display_v_res, format);
     pax_buf_reversed(&fb, display_data_endian == LCD_RGB_DATA_ENDIAN_BIG);
     pax_buf_set_orientation(&fb, orientation);
 
@@ -665,6 +669,12 @@ void app_main(void) {
                         break;
                     case BSP_INPUT_SCANCODE_SPACE:
                         key_space = !released;
+                        break;
+                    case BSP_INPUT_SCANCODE_TAB:
+                        if (!released) {
+                            ESP_LOGI(TAG, "Tab pressed - requesting buffer dump");
+                            yuv_convert_request_dump();
+                        }
                         break;
                     case BSP_INPUT_SCANCODE_LEFTCTRL:
                     case BSP_INPUT_SCANCODE_ESCAPED_RCTRL:

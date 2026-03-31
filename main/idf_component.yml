@@ -4,3 +4,4 @@ dependencies:
   robotman2412/pax-gfx: "^2.0.6"
   espressif/esp_audio_codec: ">=2.3.0"
   espressif/esp_h264: ">=1.1.0"
+  espressif/esp_image_effects: ">=1.0.0"

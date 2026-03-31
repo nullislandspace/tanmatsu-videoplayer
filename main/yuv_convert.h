@@ -23,5 +23,8 @@ esp_err_t yuv_to_framebuffer(uint8_t* yuv_in, uint8_t* fb_out,
 // Returns NULL if PPA is not initialized or software fallback is active
 uint8_t* yuv_convert_get_output_buffer(void);
 
+// Request a one-shot dump of the YUV input and PPA output to SD card
+void yuv_convert_request_dump(void);
+
 // Deinitialize the converter (unregisters PPA client)
 void yuv_convert_deinit(void);

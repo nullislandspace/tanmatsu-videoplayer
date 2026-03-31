@@ -1,10 +1,10 @@
-// YUV420 to BGR888 conversion with 270-degree rotation and letterboxing
+// YUV420 to BGR888 conversion with 270-degree rotation, scaling, and letterboxing
 //
-// Two implementation paths:
-//   1. PPA hardware acceleration (preferred) - YUV420→RGB888 + rotation in one DMA op
-//   2. Software fallback - CPU-based BT.601 conversion with lookup tables
+// Pipeline:
+//   1. esp_image_effects (SIMD) - I420 → BGR888 color conversion
+//   2. PPA hardware (DMA)       - 270° rotation + optional scaling
 //
-// To switch: set USE_PPA_HARDWARE to 0 to force software path
+// To switch: set USE_PPA_HARDWARE to 0 to force pure software path
 
 #include "yuv_convert.h"
 #include "esp_log.h"
@@ -17,27 +17,30 @@ static const char* TAG = "yuv_convert";
 // ============================================================================
 // CONFIGURATION: Set to 0 to disable PPA and use software fallback
 // ============================================================================
-#define USE_PPA_HARDWARE 0
+#define USE_PPA_HARDWARE 1
 
 #if USE_PPA_HARDWARE
 // ============================================================================
-// PPA HARDWARE PATH
+// esp_image_effects + PPA HARDWARE PATH
 // ============================================================================
 #include "driver/ppa.h"
+#include "esp_imgfx_color_convert.h"
 
 // Cache line size for PPA DMA alignment
 #define PPA_CACHE_LINE 64
 
 static ppa_client_handle_t ppa_client = NULL;
+static bool dump_requested = false;
 
-// Cache-aligned output buffer for PPA (framebuffer may not be aligned)
-static uint8_t* ppa_out_buf = NULL;
-static size_t ppa_out_buf_size = 0;
-// Cache-aligned copy of YUV input (H.264 decoder buffer may not be aligned)
-static uint8_t* ppa_in_buf = NULL;
-static size_t ppa_in_buf_size = 0;
+// Color converter handle (esp_image_effects)
+static esp_imgfx_color_convert_handle_t color_converter = NULL;
+
+// Intermediate BGR888 buffer (output of color conversion, input to PPA rotation)
+static uint8_t* ppa_mid_buf = NULL;
+static size_t ppa_mid_buf_size = 0;
 
 esp_err_t yuv_convert_init(void) {
+    // Register PPA SRM client for rotation/scaling
     ppa_client_config_t ppa_cfg = {
         .oper_type = PPA_OPERATION_SRM,
         .max_pending_trans_num = 1,
@@ -50,32 +53,18 @@ esp_err_t yuv_convert_init(void) {
         return ret;
     }
 
-    // Allocate cache-aligned output buffer for PPA (full display size RGB888)
-    // Size must also be aligned to cache line
-    ppa_out_buf_size = (800 * 480 * 3 + PPA_CACHE_LINE - 1) & ~(PPA_CACHE_LINE - 1);
-    ppa_out_buf = heap_caps_aligned_alloc(PPA_CACHE_LINE, ppa_out_buf_size, MALLOC_CAP_SPIRAM);
-    if (!ppa_out_buf) {
-        ESP_LOGE(TAG, "Failed to allocate PPA output buffer (%zu bytes)", ppa_out_buf_size);
+    // Allocate intermediate buffer for color conversion output (max source size BGR888)
+    ppa_mid_buf_size = (800 * 480 * 3 + PPA_CACHE_LINE - 1) & ~(PPA_CACHE_LINE - 1);
+    ppa_mid_buf = heap_caps_aligned_alloc(PPA_CACHE_LINE, ppa_mid_buf_size, MALLOC_CAP_SPIRAM);
+    if (!ppa_mid_buf) {
+        ESP_LOGE(TAG, "Failed to allocate mid buffer (%zu bytes)", ppa_mid_buf_size);
         ppa_unregister_client(ppa_client);
         ppa_client = NULL;
         return ESP_ERR_NO_MEM;
     }
 
-    // Allocate cache-aligned input buffer for YUV data
-    // Max: 800x480 YUV420 = 800*480*1.5 = 576000, aligned up
-    ppa_in_buf_size = (800 * 480 * 3 / 2 + PPA_CACHE_LINE - 1) & ~(PPA_CACHE_LINE - 1);
-    ppa_in_buf = heap_caps_aligned_alloc(PPA_CACHE_LINE, ppa_in_buf_size, MALLOC_CAP_SPIRAM);
-    if (!ppa_in_buf) {
-        ESP_LOGE(TAG, "Failed to allocate PPA input buffer (%zu bytes)", ppa_in_buf_size);
-        heap_caps_free(ppa_out_buf);
-        ppa_out_buf = NULL;
-        ppa_unregister_client(ppa_client);
-        ppa_client = NULL;
-        return ESP_ERR_NO_MEM;
-    }
-
-    ESP_LOGI(TAG, "YUV converter initialized (PPA hardware, in=%zu out=%zu bytes)",
-             ppa_in_buf_size, ppa_out_buf_size);
+    ESP_LOGI(TAG, "YUV converter initialized (esp_image_effects + PPA, mid=%zu bytes)",
+             ppa_mid_buf_size);
     return ESP_OK;
 }
 
@@ -83,115 +72,164 @@ esp_err_t yuv_to_framebuffer(uint8_t* yuv_in, uint8_t* fb_out,
                               int src_width, int src_height,
                               int visible_width, int visible_height,
                               int display_width, int display_height) {
-    if (!ppa_client || !yuv_in || !fb_out || !ppa_in_buf || !ppa_out_buf) {
+    if (!ppa_client || !yuv_in || !fb_out || !ppa_mid_buf) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    // Copy YUV input to cache-aligned buffer (H.264 decoder buffer may not be aligned)
-    size_t yuv_size = src_width * src_height * 3 / 2;
-    if (yuv_size > ppa_in_buf_size) {
-        ESP_LOGE(TAG, "YUV data too large: %zu > %zu", yuv_size, ppa_in_buf_size);
-        return ESP_ERR_NO_MEM;
+    // --- Pass 1: I420 → BGR888 via esp_image_effects (SIMD-accelerated) ---
+
+    // Create or reconfigure color converter for current dimensions
+    // (dimensions may change between videos)
+    if (!color_converter) {
+        esp_imgfx_color_convert_cfg_t cc_cfg = {
+            .in_res = { .width = src_width, .height = src_height },
+            .in_pixel_fmt = ESP_IMGFX_PIXEL_FMT_I420,
+            .out_pixel_fmt = ESP_IMGFX_PIXEL_FMT_BGR888,
+            .color_space_std = ESP_IMGFX_COLOR_SPACE_STD_BT601,
+        };
+        esp_imgfx_err_t ie_ret = esp_imgfx_color_convert_open(&cc_cfg, &color_converter);
+        if (ie_ret != ESP_IMGFX_ERR_OK) {
+            ESP_LOGE(TAG, "Failed to open color converter: %d", ie_ret);
+            return ESP_FAIL;
+        }
     }
-    memcpy(ppa_in_buf, yuv_in, yuv_size);
 
-    // Sync input cache before DMA
-    esp_cache_msync(ppa_in_buf, ppa_in_buf_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+    size_t yuv_size = src_width * src_height * 3 / 2;
+    size_t bgr_size = (size_t)visible_width * visible_height * 3;
 
-    // Step 1: PPA converts YUV420→RGB888 (no rotation, no scaling)
-    // Output is a flat visible_width × visible_height RGB888 buffer
-    size_t rgb_size = visible_width * visible_height * 3;
-    // Ensure output buffer size covers this (it's allocated for full display, so always enough)
+    esp_imgfx_data_t in_img = { .data = yuv_in, .data_len = yuv_size };
+    esp_imgfx_data_t out_img = { .data = ppa_mid_buf, .data_len = bgr_size };
 
-    ppa_srm_oper_config_t srm_config = {
+    esp_imgfx_err_t ie_ret = esp_imgfx_color_convert_process(color_converter, &in_img, &out_img);
+    if (ie_ret != ESP_IMGFX_ERR_OK) {
+        ESP_LOGE(TAG, "Color conversion failed: %d", ie_ret);
+        return ESP_FAIL;
+    }
+
+    // Flush color conversion output to PSRAM for PPA DMA
+    size_t mid_size_aligned = (bgr_size + PPA_CACHE_LINE - 1) & ~(PPA_CACHE_LINE - 1);
+    esp_cache_msync(ppa_mid_buf, mid_size_aligned, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+
+    // --- Pass 2: BGR888 → BGR888 + 270° rotation (+ optional scaling) via PPA ---
+
+    // Physical framebuffer dimensions (portrait: 480w x 800h)
+    int fb_w = display_height;  // 480
+    int fb_h = display_width;   // 800
+
+    // After 270° rotation: input W x H -> output H x W
+    // With scaling: output becomes (H * scale_y) x (W * scale_x)
+    // We scale to fit the display while maintaining aspect ratio
+    float scale_x = (float)fb_h / visible_width;   // scale to fill height
+    float scale_y = (float)fb_w / visible_height;   // scale to fill width
+    // Use the smaller scale to maintain aspect ratio (letterbox/pillarbox)
+    float scale = (scale_x < scale_y) ? scale_x : scale_y;
+    // Clamp to max PPA supports and avoid upscaling beyond 1:1 if video is larger
+    if (scale > 1.0f && visible_width >= fb_h && visible_height >= fb_w) {
+        scale = 1.0f;
+    }
+
+    int out_block_w = (int)(visible_height * scale);
+    int out_block_h = (int)(visible_width * scale);
+
+    int offset_x = (fb_w - out_block_w) / 2;
+    int offset_y = (fb_h - out_block_h) / 2;
+    if (offset_x < 0) offset_x = 0;
+    if (offset_y < 0) offset_y = 0;
+
+    // PPA writes directly to the framebuffer (must be 64-byte aligned)
+    size_t fb_size = (size_t)fb_w * fb_h * 3;
+    size_t fb_size_aligned = (fb_size + PPA_CACHE_LINE - 1) & ~(PPA_CACHE_LINE - 1);
+
+    // Flush framebuffer cache before PPA DMA writes to it
+    esp_cache_msync(fb_out, fb_size_aligned, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+
+    ppa_srm_oper_config_t srm_rotate = {
         .in = {
-            .buffer = ppa_in_buf,
-            .pic_w = src_width,
-            .pic_h = src_height,
+            .buffer = ppa_mid_buf,
+            .pic_w = visible_width,
+            .pic_h = visible_height,
             .block_w = visible_width,
             .block_h = visible_height,
             .block_offset_x = 0,
             .block_offset_y = 0,
-            .srm_cm = PPA_SRM_COLOR_MODE_YUV420,
-            .yuv_range = PPA_COLOR_RANGE_LIMIT,
-            .yuv_std = PPA_COLOR_CONV_STD_RGB_YUV_BT601,
-        },
-        .out = {
-            .buffer = ppa_out_buf,
-            .buffer_size = ppa_out_buf_size,
-            .pic_w = visible_width,
-            .pic_h = visible_height,
-            .block_offset_x = 0,
-            .block_offset_y = 0,
             .srm_cm = PPA_SRM_COLOR_MODE_RGB888,
         },
-        .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
-        .scale_x = 1.0f,
-        .scale_y = 1.0f,
-        .mirror_x = false,
-        .mirror_y = false,
-        .rgb_swap = false,
-        .byte_swap = false,
-        .alpha_update_mode = PPA_ALPHA_NO_CHANGE,
+        .out = {
+            .buffer = fb_out,
+            .buffer_size = fb_size_aligned,
+            .pic_w = fb_w,
+            .pic_h = fb_h,
+            .block_offset_x = offset_x,
+            .block_offset_y = offset_y,
+            .srm_cm = PPA_SRM_COLOR_MODE_RGB888,
+        },
+        .rotation_angle = PPA_SRM_ROTATION_ANGLE_270,
+        .scale_x = scale,
+        .scale_y = scale,
         .mode = PPA_TRANS_MODE_BLOCKING,
     };
 
-    esp_err_t ret = ppa_do_scale_rotate_mirror(ppa_client, &srm_config);
+    esp_err_t ret = ppa_do_scale_rotate_mirror(ppa_client, &srm_rotate);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "PPA SRM operation failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "PPA rotate failed: %s (scale=%.2f, in=%dx%d, out_block=%dx%d, offset=%d,%d)",
+                 esp_err_to_name(ret), scale, visible_width, visible_height,
+                 out_block_w, out_block_h, offset_x, offset_y);
         return ret;
     }
 
-    // Sync output cache after DMA
-    esp_cache_msync(ppa_out_buf, (rgb_size + PPA_CACHE_LINE - 1) & ~(PPA_CACHE_LINE - 1),
-                    ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+    // Invalidate framebuffer cache after PPA DMA wrote to it
+    esp_cache_msync(fb_out, fb_size_aligned, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
 
-    // Step 2: Copy PPA RGB888 output to framebuffer with 270° rotation + centering
-    // This reuses the same rotation logic as mjpeg_copy_to_framebuffer
-    // PPA output is RGB order; display expects BGR — swap R and B during copy
-    int offset_x = (display_width - visible_width) / 2;
-    int offset_y = (display_height - visible_height) / 2;
-    if (offset_x < 0) offset_x = 0;
-    if (offset_y < 0) offset_y = 0;
+    // Dump buffers to SD card if requested
+    if (dump_requested) {
+        dump_requested = false;
+        ESP_LOGI(TAG, "Dumping buffers to SD card...");
 
-    int fb_stride_bytes = display_height * 3;
+        FILE* f = fopen("/sd/ppa_converted.bin", "wb");
+        if (f) {
+            uint32_t hdr[4] = { visible_width, visible_height, 0, 0 };
+            fwrite(hdr, sizeof(uint32_t), 4, f);
+            fwrite(ppa_mid_buf, 1, bgr_size, f);
+            fclose(f);
+            ESP_LOGI(TAG, "Wrote /sd/ppa_converted.bin");
+        }
 
-    for (int sy = 0; sy < visible_height; sy++) {
-        uint8_t* src_row = ppa_out_buf + sy * visible_width * 3;
-        int buf_x = display_height - 1 - (offset_y + sy);
-
-        for (int sx = 0; sx < visible_width; sx++) {
-            int buf_y = offset_x + sx;
-            uint8_t* dst = fb_out + buf_y * fb_stride_bytes + buf_x * 3;
-            // PPA outputs RGB, display wants BGR — swap R and B
-            dst[0] = src_row[sx * 3 + 2];  // B <- R
-            dst[1] = src_row[sx * 3 + 1];  // G
-            dst[2] = src_row[sx * 3 + 0];  // R <- B
+        f = fopen("/sd/ppa_rotated.bin", "wb");
+        if (f) {
+            uint32_t hdr[4] = { fb_w, fb_h, out_block_w, out_block_h };
+            fwrite(hdr, sizeof(uint32_t), 4, f);
+            fwrite(fb_out, 1, fb_size, f);
+            fclose(f);
+            ESP_LOGI(TAG, "Wrote /sd/ppa_rotated.bin");
         }
     }
 
     return ESP_OK;
 }
 
+void yuv_convert_request_dump(void) {
+    dump_requested = true;
+    ESP_LOGI(TAG, "Buffer dump requested");
+}
+
 uint8_t* yuv_convert_get_output_buffer(void) {
-    return ppa_out_buf;
+    return NULL;  // PPA writes directly to framebuffer now
 }
 
 void yuv_convert_deinit(void) {
+    if (color_converter) {
+        esp_imgfx_color_convert_close(color_converter);
+        color_converter = NULL;
+    }
     if (ppa_client) {
         ppa_unregister_client(ppa_client);
         ppa_client = NULL;
     }
-    if (ppa_out_buf) {
-        heap_caps_free(ppa_out_buf);
-        ppa_out_buf = NULL;
+    if (ppa_mid_buf) {
+        heap_caps_free(ppa_mid_buf);
+        ppa_mid_buf = NULL;
     }
-    if (ppa_in_buf) {
-        heap_caps_free(ppa_in_buf);
-        ppa_in_buf = NULL;
-    }
-    ppa_out_buf_size = 0;
-    ppa_in_buf_size = 0;
+    ppa_mid_buf_size = 0;
     ESP_LOGI(TAG, "YUV converter deinitialized");
 }
 
@@ -299,6 +337,10 @@ esp_err_t yuv_to_framebuffer(uint8_t* yuv_in, uint8_t* fb_out,
 
 uint8_t* yuv_convert_get_output_buffer(void) {
     return NULL;  // Software path writes directly to fb_out
+}
+
+void yuv_convert_request_dump(void) {
+    // No-op in software path
 }
 
 void yuv_convert_deinit(void) {
