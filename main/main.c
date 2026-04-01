@@ -581,11 +581,22 @@ void app_main(void) {
         default: break;
     }
 
-    // Allocate 64-byte aligned framebuffer so PPA can write to it directly
-    size_t fb_size = display_h_res * display_v_res * (format == PAX_BUF_16_565RGB ? 2 : 3);
-    void* fb_mem = heap_caps_aligned_alloc(64, fb_size, MALLOC_CAP_SPIRAM);
-    assert(fb_mem);
-    pax_buf_init(&fb, fb_mem, display_h_res, display_v_res, format);
+    // Let PAX allocate normally, then check if it's 64-byte aligned for PPA DMA.
+    // If not, reallocate with proper alignment.
+    pax_buf_init(&fb, NULL, display_h_res, display_v_res, format);
+    void* fb_pixels_ptr = pax_buf_get_pixels_rw(&fb);
+    if (((uintptr_t)fb_pixels_ptr & 63) != 0) {
+        ESP_LOGW(TAG, "PAX framebuffer not 64-byte aligned (%p), reallocating", fb_pixels_ptr);
+        pax_buf_destroy(&fb);
+        size_t fb_size = display_h_res * display_v_res * (format == PAX_BUF_16_565RGB ? 2 : 3);
+        size_t fb_size_aligned = (fb_size + 63) & ~(size_t)63;
+        void* fb_mem = aligned_alloc(64, fb_size_aligned);
+        assert(fb_mem);
+        memset(fb_mem, 0, fb_size_aligned);
+        pax_buf_init(&fb, fb_mem, display_h_res, display_v_res, format);
+    } else {
+        ESP_LOGI(TAG, "PAX framebuffer already 64-byte aligned (%p)", fb_pixels_ptr);
+    }
     pax_buf_reversed(&fb, display_data_endian == LCD_RGB_DATA_ENDIAN_BIG);
     pax_buf_set_orientation(&fb, orientation);
 
