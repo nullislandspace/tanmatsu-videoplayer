@@ -1,76 +1,42 @@
-// Video Decoder - H.264 software decoding using esp_h264 component
-// Supports arbitrary resolutions (buffer sized at init time)
+// Video Decoder - H.264 software decoding using open-source h264bsd
+// Outputs I420 planar YUV (to be reformatted for PPA hardware)
 
 #include "video_decoder.h"
-#include "esp_h264_dec.h"
-#include "esp_h264_dec_sw.h"
-#include "esp_h264_dec_param.h"
+#include "h264bsd_decoder.h"
+#include "h264bsd_util.h"
+#include "h264bsd_storage.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include <string.h>
 
 static const char* TAG = "video_decoder";
 
-static esp_h264_dec_handle_t decoder = NULL;
-static esp_h264_dec_param_handle_t param_handle = NULL;
-static uint8_t* yuv_buffer = NULL;
-static size_t yuv_buffer_size = 0;
+static storage_t* decoder = NULL;
 static int configured_width = 0;
 static int configured_height = 0;
+static uint32_t pic_id = 0;
 
 esp_err_t video_decoder_init(int max_width, int max_height) {
-    ESP_LOGI(TAG, "Initializing H.264 software decoder for %dx%d", max_width, max_height);
+    ESP_LOGI(TAG, "Initializing h264bsd decoder for %dx%d", max_width, max_height);
 
     configured_width = max_width;
     configured_height = max_height;
 
-    // H.264 uses 16x16 macroblocks, decoder outputs padded dimensions
-    int aligned_w = (max_width + 15) & ~15;
-    int aligned_h = (max_height + 15) & ~15;
-
-    // YUV420: Y = w*h, U = w*h/4, V = w*h/4 = w*h*3/2
-    yuv_buffer_size = aligned_w * aligned_h * 3 / 2;
-
-    ESP_LOGI(TAG, "Aligned: %dx%d, YUV buffer: %zu bytes", aligned_w, aligned_h, yuv_buffer_size);
-
-    // Allocate in PSRAM (too large for internal SRAM at display resolutions)
-    yuv_buffer = heap_caps_malloc(yuv_buffer_size, MALLOC_CAP_SPIRAM);
-    if (!yuv_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate YUV buffer (%zu bytes)", yuv_buffer_size);
+    decoder = h264bsdAlloc();
+    if (!decoder) {
+        ESP_LOGE(TAG, "Failed to allocate decoder");
         return ESP_ERR_NO_MEM;
     }
-    memset(yuv_buffer, 0, yuv_buffer_size);
 
-    // Create software decoder
-    esp_h264_dec_cfg_t cfg = {
-        .pic_type = ESP_H264_RAW_FMT_I420,
-    };
-
-    esp_h264_err_t ret = esp_h264_dec_sw_new(&cfg, &decoder);
-    if (ret != ESP_H264_ERR_OK) {
-        ESP_LOGE(TAG, "Failed to create H.264 decoder: %d", ret);
-        heap_caps_free(yuv_buffer);
-        yuv_buffer = NULL;
-        return ESP_FAIL;
-    }
-
-    ret = esp_h264_dec_sw_get_param_hd(decoder, &param_handle);
-    if (ret != ESP_H264_ERR_OK) {
-        ESP_LOGW(TAG, "Failed to get param handle: %d", ret);
-        param_handle = NULL;
-    }
-
-    ret = esp_h264_dec_open(decoder);
-    if (ret != ESP_H264_ERR_OK) {
-        ESP_LOGE(TAG, "Failed to open H.264 decoder: %d", ret);
-        esp_h264_dec_del(decoder);
+    u32 ret = h264bsdInit(decoder, 1);  // noOutputReordering=1 for low latency
+    if (ret != HANTRO_OK) {
+        ESP_LOGE(TAG, "Failed to init decoder: %u", ret);
+        h264bsdFree(decoder);
         decoder = NULL;
-        heap_caps_free(yuv_buffer);
-        yuv_buffer = NULL;
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "H.264 decoder initialized (%zu bytes YUV buffer)", yuv_buffer_size);
+    ESP_LOGI(TAG, "h264bsd decoder initialized");
     return ESP_OK;
 }
 
@@ -80,74 +46,84 @@ esp_err_t video_decoder_decode(uint8_t* nal_data, size_t nal_size,
         return ESP_ERR_INVALID_ARG;
     }
 
-    esp_h264_dec_in_frame_t in_frame = {
-        .pts = 0,
-        .raw_data = {
-            .buffer = nal_data,
-            .len = nal_size,
-        },
-        .consume = 0,
-    };
+    *yuv_out = NULL;
+    u32 readBytes = 0;
+    u8* remaining = nal_data;
+    u32 remaining_len = nal_size;
 
-    esp_h264_dec_out_frame_t out_frame = {0};
+    // Feed all NAL units in this chunk to the decoder
+    while (remaining_len > 0) {
+        u32 ret = h264bsdDecode(decoder, remaining, remaining_len, pic_id, &readBytes);
 
-    esp_h264_err_t ret = esp_h264_dec_process(decoder, &in_frame, &out_frame);
-
-    if (ret == ESP_H264_ERR_OK && out_frame.outbuf && out_frame.out_size > 0) {
-        size_t copy_size = out_frame.out_size;
-        if (copy_size > yuv_buffer_size) {
-            ESP_LOGW(TAG, "Decoded frame larger than buffer: %zu > %zu", copy_size, yuv_buffer_size);
-            copy_size = yuv_buffer_size;
+        if (readBytes == 0 && ret != H264BSD_PIC_RDY && ret != H264BSD_HDRS_RDY) {
+            break;  // No progress, avoid infinite loop
         }
-        memcpy(yuv_buffer, out_frame.outbuf, copy_size);
 
-        // Get actual resolution from decoder
-        if (param_handle) {
-            esp_h264_resolution_t res = {0};
-            if (esp_h264_dec_get_resolution(param_handle, &res) == ESP_H264_ERR_OK) {
-                *width = res.width;
-                *height = res.height;
-            } else {
-                *width = configured_width;
-                *height = configured_height;
+        remaining += readBytes;
+        remaining_len -= readBytes;
+
+        switch (ret) {
+            case H264BSD_PIC_RDY: {
+                // Picture decoded — get the output
+                u32 outPicId = 0, isIdr = 0, numErrMbs = 0;
+                u8* pic = h264bsdNextOutputPicture(decoder, &outPicId, &isIdr, &numErrMbs);
+                if (pic) {
+                    *width = h264bsdPicWidth(decoder) * 16;
+                    *height = h264bsdPicHeight(decoder) * 16;
+                    *yuv_out = pic;
+                    pic_id++;
+
+                    static bool first_frame = true;
+                    if (first_frame) {
+                        ESP_LOGI(TAG, "First h264bsd frame: %dx%d", *width, *height);
+                        first_frame = false;
+                    }
+
+                    return ESP_OK;
+                }
+                break;
             }
-        } else {
-            *width = configured_width;
-            *height = configured_height;
+            case H264BSD_HDRS_RDY: {
+                // SPS/PPS decoded, resolution may be available now
+                u32 w = h264bsdPicWidth(decoder);
+                u32 h = h264bsdPicHeight(decoder);
+                if (w && h) {
+                    ESP_LOGI(TAG, "Stream headers: %ux%u", w * 16, h * 16);
+                }
+                // Continue decoding — there may be more data in this chunk
+                break;
+            }
+            case H264BSD_RDY:
+                // NAL unit processed but no picture yet, continue
+                break;
+            case H264BSD_ERROR:
+                ESP_LOGW(TAG, "h264bsd decode error");
+                return ESP_FAIL;
+            case H264BSD_PARAM_SET_ERROR:
+                ESP_LOGE(TAG, "h264bsd param set error");
+                return ESP_FAIL;
+            case H264BSD_MEMALLOC_ERROR:
+                ESP_LOGE(TAG, "h264bsd memory allocation error");
+                return ESP_ERR_NO_MEM;
+            default:
+                break;
         }
-
-        static bool first_frame = true;
-        if (first_frame) {
-            ESP_LOGI(TAG, "First H.264 frame: %dx%d, %zu bytes", *width, *height, copy_size);
-            first_frame = false;
-        }
-
-        *yuv_out = yuv_buffer;
-        return ESP_OK;
-    } else if (ret == ESP_H264_ERR_OK) {
-        return ESP_ERR_NOT_FINISHED;
-    } else {
-        ESP_LOGW(TAG, "H.264 decode error: %d", ret);
-        return ESP_FAIL;
     }
+
+    // No picture produced yet (decoder is buffering)
+    return ESP_ERR_NOT_FINISHED;
 }
 
 void video_decoder_deinit(void) {
     if (decoder) {
-        esp_h264_dec_close(decoder);
-        esp_h264_dec_del(decoder);
+        h264bsdShutdown(decoder);
+        h264bsdFree(decoder);
         decoder = NULL;
-        param_handle = NULL;
     }
 
-    if (yuv_buffer) {
-        heap_caps_free(yuv_buffer);
-        yuv_buffer = NULL;
-    }
-
-    yuv_buffer_size = 0;
     configured_width = 0;
     configured_height = 0;
+    pic_id = 0;
 
-    ESP_LOGI(TAG, "H.264 decoder deinitialized");
+    ESP_LOGI(TAG, "h264bsd decoder deinitialized");
 }

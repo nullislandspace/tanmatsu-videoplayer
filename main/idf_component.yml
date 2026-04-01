@@ -1,7 +1,7 @@
 dependencies:
   idf: ">=5.5.1"
   badgeteam/badge-bsp: "^0.8.0"
-  robotman2412/pax-gfx: "^2.0.6"
+  robotman2412/pax-gfx:
+    version: "^2.0.6"
+    override_path: "../components/pax-gfx"
   espressif/esp_audio_codec: ">=2.3.0"
-  espressif/esp_h264: ">=1.1.0"
-  espressif/esp_image_effects: ">=1.0.0"

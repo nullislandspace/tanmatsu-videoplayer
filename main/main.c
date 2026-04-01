@@ -93,7 +93,7 @@ static int64_t total_pause_duration_us = 0;
 
 // Mute state
 static bool muted = false;
-static int volume = 100;
+static int volume = 0;
 
 // FPS overlay
 static bool show_fps = false;

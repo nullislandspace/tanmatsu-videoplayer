@@ -13,6 +13,7 @@ idf_component_register(
 	PRIV_REQUIRES
 		esp_lcd
 		badge-bsp
+		h264bsd
 		fatfs
 		sdmmc
 		esp_driver_sdmmc
@@ -21,6 +22,7 @@ idf_component_register(
 		esp_driver_i2s
 		esp_driver_jpeg
 		esp_driver_ppa
+		esp_mm
 		vfs
 	INCLUDE_DIRS
 		"."
