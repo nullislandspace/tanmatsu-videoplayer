@@ -89,7 +89,7 @@ esp_err_t audio_player_init(void) {
     }
 
     bsp_audio_set_amplifier(true);
-    bsp_audio_set_volume(0.0f);
+    bsp_audio_set_volume(100.0f);
 
     ESP_LOGI(TAG, "Audio player initialized");
     return ESP_OK;
