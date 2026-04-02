@@ -119,6 +119,8 @@ static int64_t last_hp_check_us = 0;
 // Timing statistics
 static uint32_t timing_decode_us = 0;
 static uint32_t timing_copy_us = 0;
+static uint32_t timing_reformat_us = 0;
+static uint32_t timing_ppa_us = 0;
 static uint32_t timing_frame_count = 0;
 
 // Seek intervals (in seconds)
@@ -349,6 +351,8 @@ static bool process_video_frame(uint8_t* fb_pixels, int fb_stride, int fb_height
                                width, height, 800, 480);
             timing_decode_us += (t1 - t0);
             timing_copy_us += (esp_timer_get_time() - t1);
+            timing_reformat_us += yuv_convert_get_reformat_us();
+            timing_ppa_us += yuv_convert_get_ppa_us();
             frame_ready = true;
         } else if (ret == ESP_ERR_NOT_FINISHED) {
             // H.264 decoder is buffering, not an error
@@ -369,10 +373,14 @@ static bool process_video_frame(uint8_t* fb_pixels, int fb_stride, int fb_height
         timing_frame_count++;
 
         if (timing_frame_count >= 30) {
-            ESP_LOGI(TAG, "Avg(30): Decode=%.1fms Copy=%.1fms | Buf=%d",
-                     timing_decode_us / 30000.0f, timing_copy_us / 30000.0f, video_buffered);
+            ESP_LOGI(TAG, "Avg(30): Decode=%.1fms Copy=%.1fms (Reformat=%.1fms PPA=%.1fms) | Buf=%d",
+                     timing_decode_us / 30000.0f, timing_copy_us / 30000.0f,
+                     timing_reformat_us / 30000.0f, timing_ppa_us / 30000.0f,
+                     video_buffered);
             timing_decode_us = 0;
             timing_copy_us = 0;
+            timing_reformat_us = 0;
+            timing_ppa_us = 0;
             timing_frame_count = 0;
         }
     }
@@ -476,6 +484,8 @@ static esp_err_t start_playback(const char* path) {
     fps_last_time_us = esp_timer_get_time();
     timing_decode_us = 0;
     timing_copy_us = 0;
+    timing_reformat_us = 0;
+    timing_ppa_us = 0;
     timing_frame_count = 0;
 
     // Sync timing to audio position

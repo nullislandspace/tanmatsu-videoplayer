@@ -16,6 +16,7 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_cache.h"
+#include "esp_timer.h"
 #include <string.h>
 
 static const char* TAG = "yuv_convert";
@@ -35,6 +36,8 @@ static const char* TAG = "yuv_convert";
 
 static ppa_client_handle_t ppa_client = NULL;
 static bool dump_requested = false;
+static uint32_t last_reformat_us = 0;
+static uint32_t last_ppa_us = 0;
 
 // PPA-packed YUV420 buffer (output of reformat, input to PPA)
 static uint8_t* ppa_yuv_buf = NULL;
@@ -154,6 +157,8 @@ esp_err_t yuv_to_framebuffer(uint8_t* yuv_in, uint8_t* fb_out,
     // The actual stride in bytes for PPA packed format
     int ppa_stride = visible_width * 3 / 2;  // 1.5 bytes per pixel
 
+    int64_t t_reformat_start = esp_timer_get_time();
+
     i420_to_ppa_yuv420(y_plane, u_plane, v_plane,
                        src_width, src_width / 2,
                        visible_width, visible_height,
@@ -163,6 +168,8 @@ esp_err_t yuv_to_framebuffer(uint8_t* yuv_in, uint8_t* fb_out,
     size_t yuv_packed_size = (size_t)ppa_stride * visible_height;
     size_t yuv_aligned = (yuv_packed_size + PPA_CACHE_LINE - 1) & ~(PPA_CACHE_LINE - 1);
     esp_cache_msync(ppa_yuv_buf, yuv_aligned, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+
+    last_reformat_us = (uint32_t)(esp_timer_get_time() - t_reformat_start);
 
     // --- Step 2: PPA YUV→RGB + 270° rotation + scaling ---
     int fb_w = display_height;  // 480 (physical framebuffer width)
@@ -220,6 +227,8 @@ esp_err_t yuv_to_framebuffer(uint8_t* yuv_in, uint8_t* fb_out,
         .mode = PPA_TRANS_MODE_BLOCKING,
     };
 
+    int64_t t_ppa_start = esp_timer_get_time();
+
     esp_err_t ret = ppa_do_scale_rotate_mirror(ppa_client, &srm);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "PPA failed: %s (scale=%.2f, in=%dx%d, block=%dx%d, off=%d,%d)",
@@ -229,6 +238,8 @@ esp_err_t yuv_to_framebuffer(uint8_t* yuv_in, uint8_t* fb_out,
     }
 
     esp_cache_msync(fb_out, fb_size_aligned, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+
+    last_ppa_us = (uint32_t)(esp_timer_get_time() - t_ppa_start);
 
     // Dump buffers to SD card if requested
     if (dump_requested) {
@@ -264,6 +275,14 @@ void yuv_convert_request_dump(void) {
 
 uint8_t* yuv_convert_get_output_buffer(void) {
     return NULL;  // PPA writes directly to framebuffer
+}
+
+uint32_t yuv_convert_get_reformat_us(void) {
+    return last_reformat_us;
+}
+
+uint32_t yuv_convert_get_ppa_us(void) {
+    return last_ppa_us;
 }
 
 void yuv_convert_deinit(void) {
