@@ -185,7 +185,6 @@ u32 h264bsdShowBits32(strmData_t *pStrmData)
             END_OF_STREAM   not enough bits left
 
 ------------------------------------------------------------------------------*/
-#ifndef H264DEC_NEON
 u32 h264bsdFlushBits(strmData_t *pStrmData, u32 numBits)
 {
 
@@ -207,7 +206,6 @@ u32 h264bsdFlushBits(strmData_t *pStrmData, u32 numBits)
         return(END_OF_STREAM);
 
 }
-#endif
 /*------------------------------------------------------------------------------
 
     Function: h264bsdIsByteAligned

@@ -77,7 +77,6 @@ const u32 h264bsdQpC[52] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,
             number of leading zeros in the code word
 
 ------------------------------------------------------------------------------*/
-#ifndef H264DEC_NEON
 u32 h264bsdCountLeadingZeros(u32 value, u32 length)
 {
 
@@ -98,7 +97,6 @@ u32 h264bsdCountLeadingZeros(u32 value, u32 length)
     return(zeros);
 
 }
-#endif
 /*------------------------------------------------------------------------------
 
    5.2  Function: h264bsdRbspTrailingBits

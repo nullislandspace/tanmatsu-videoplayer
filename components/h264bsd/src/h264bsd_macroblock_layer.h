@@ -139,12 +139,7 @@ typedef struct
 
 typedef struct
 {
-#ifdef H264DEC_OMXDL
-    u8 posCoefBuf[27*16*3];
-    u8 totalCoeff[27];
-#else
     i16 totalCoeff[27];
-#endif
     i32 level[26][16];
     u32 coeffMap[24];
 } residual_t;
@@ -168,11 +163,7 @@ typedef struct mbStorage
     i32 filterOffsetB;
     u32 qpY;
     i32 chromaQpIndexOffset;
-#ifdef H264DEC_OMXDL
-    u8 totalCoeff[27];
-#else
     i16 totalCoeff[27];
-#endif
     u8 intra4x4PredMode[16];
     u32 refPic[4];
     u8* refAddr[4];
@@ -204,9 +195,6 @@ u32 h264bsdDecodeMacroblock(mbStorage_t *pMb, macroblockLayer_t *pMbLayer,
 u32 h264bsdPredModeIntra16x16(mbType_e mbType);
 
 mbPartPredMode_e h264bsdMbPartPredMode(mbType_e mbType);
-#ifdef H264DEC_NEON
-u32 h264bsdClearMbLayer(macroblockLayer_t *pMbLayer, u32 size);
-#endif
 
 #endif /* #ifdef H264SWDEC_MACROBLOCK_LAYER_H */
 

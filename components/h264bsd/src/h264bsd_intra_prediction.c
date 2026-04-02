@@ -63,10 +63,6 @@
 #include "h264bsd_neighbour.h"
 #include "h264bsd_image.h"
 
-#ifdef H264DEC_OMXDL
-#include "omxtypes.h"
-#include "omxVC.h"
-#endif /* H264DEC_OMXDL */
 
 /*------------------------------------------------------------------------------
     2. External compiler flags
@@ -160,7 +156,6 @@ u8 *get_h264bsdClip() {
     return (u8*)h264bsdClip;
 }
 
-#ifndef H264DEC_OMXDL
 /*------------------------------------------------------------------------------
     4. Local function prototypes
 ------------------------------------------------------------------------------*/
@@ -189,262 +184,10 @@ static void Intra4x4HorizontalUpPrediction(u8 *data, u8 *left);
 void h264bsdAddResidual(u8 *data, i32 *residual, u32 blockNum);
 
 static void Write4x4To16x16(u8 *data, u8 *data4x4, u32 blockNum);
-#endif /* H264DEC_OMXDL */
 
 static u32 DetermineIntra4x4PredMode(macroblockLayer_t *pMbLayer,
     u32 available, neighbour_t *nA, neighbour_t *nB, u32 index,
     mbStorage_t *nMbA, mbStorage_t *nMbB);
-
-
-#ifdef H264DEC_OMXDL
-
-/*------------------------------------------------------------------------------
-
-    Function: h264bsdIntra16x16Prediction
-
-        Functional description:
-          Perform intra 16x16 prediction mode for luma pixels and add
-          residual into prediction. The resulting luma pixels are
-          stored in macroblock array 'data'.
-
-------------------------------------------------------------------------------*/
-u32 h264bsdIntra16x16Prediction(mbStorage_t *pMb, u8 *data, u8 *ptr,
-                                u32 width, u32 constrainedIntraPred)
-{
-
-/* Variables */
-
-    u32 availableA, availableB, availableD;
-    OMXResult omxRes;
-
-/* Code */
-    ASSERT(pMb);
-    ASSERT(data);
-    ASSERT(ptr);
-    ASSERT(h264bsdPredModeIntra16x16(pMb->mbType) < 4);
-
-    availableA = h264bsdIsNeighbourAvailable(pMb, pMb->mbA);
-    if (availableA && constrainedIntraPred &&
-       (h264bsdMbPartPredMode(pMb->mbA->mbType) == PRED_MODE_INTER))
-        availableA = HANTRO_FALSE;
-    availableB = h264bsdIsNeighbourAvailable(pMb, pMb->mbB);
-    if (availableB && constrainedIntraPred &&
-       (h264bsdMbPartPredMode(pMb->mbB->mbType) == PRED_MODE_INTER))
-        availableB = HANTRO_FALSE;
-    availableD = h264bsdIsNeighbourAvailable(pMb, pMb->mbD);
-    if (availableD && constrainedIntraPred &&
-       (h264bsdMbPartPredMode(pMb->mbD->mbType) == PRED_MODE_INTER))
-        availableD = HANTRO_FALSE;
-
-    omxRes = omxVCM4P10_PredictIntra_16x16( (ptr-1),
-                                    (ptr - width),
-                                    (ptr - width-1),
-                                    data,
-                                    (i32)width,
-                                    16,
-                                    (OMXVCM4P10Intra16x16PredMode)
-                                    h264bsdPredModeIntra16x16(pMb->mbType),
-                                    (i32)(availableB + (availableA<<1) +
-                                     (availableD<<5)) );
-    if (omxRes != OMX_Sts_NoErr)
-        return HANTRO_NOK;
-    else
-        return(HANTRO_OK);
-}
-
-/*------------------------------------------------------------------------------
-
-    Function: h264bsdIntra4x4Prediction
-
-        Functional description:
-          Perform intra 4x4 prediction for luma pixels and add residual
-          into prediction. The resulting luma pixels are stored in
-          macroblock array 'data'. The intra 4x4 prediction mode for each
-          block is stored in 'pMb' structure.
-
-------------------------------------------------------------------------------*/
-u32 h264bsdIntra4x4Prediction(mbStorage_t *pMb, u8 *data,
-                              macroblockLayer_t *mbLayer,
-                              u8 *ptr, u32 width,
-                              u32 constrainedIntraPred, u32 block)
-{
-
-/* Variables */
-    u32 mode;
-    neighbour_t neighbour, neighbourB;
-    mbStorage_t *nMb, *nMb2;
-    u32 availableA, availableB, availableC, availableD;
-
-    OMXResult omxRes;
-    u32 x, y;
-    u8 *l, *a, *al;
-/* Code */
-    ASSERT(pMb);
-    ASSERT(data);
-    ASSERT(mbLayer);
-    ASSERT(ptr);
-    ASSERT(pMb->intra4x4PredMode[block] < 9);
-
-    neighbour = *h264bsdNeighbour4x4BlockA(block);
-    nMb = h264bsdGetNeighbourMb(pMb, neighbour.mb);
-    availableA = h264bsdIsNeighbourAvailable(pMb, nMb);
-    if (availableA && constrainedIntraPred &&
-       ( h264bsdMbPartPredMode(nMb->mbType) == PRED_MODE_INTER) )
-    {
-        availableA = HANTRO_FALSE;
-    }
-
-    neighbourB = *h264bsdNeighbour4x4BlockB(block);
-    nMb2 = h264bsdGetNeighbourMb(pMb, neighbourB.mb);
-    availableB = h264bsdIsNeighbourAvailable(pMb, nMb2);
-    if (availableB && constrainedIntraPred &&
-       ( h264bsdMbPartPredMode(nMb2->mbType) == PRED_MODE_INTER) )
-    {
-        availableB = HANTRO_FALSE;
-    }
-
-    mode = DetermineIntra4x4PredMode(mbLayer,
-        (u32)(availableA && availableB),
-        &neighbour, &neighbourB, block, nMb, nMb2);
-    pMb->intra4x4PredMode[block] = (u8)mode;
-
-    neighbour = *h264bsdNeighbour4x4BlockC(block);
-    nMb = h264bsdGetNeighbourMb(pMb, neighbour.mb);
-    availableC = h264bsdIsNeighbourAvailable(pMb, nMb);
-    if (availableC && constrainedIntraPred &&
-       ( h264bsdMbPartPredMode(nMb->mbType) == PRED_MODE_INTER) )
-    {
-        availableC = HANTRO_FALSE;
-    }
-
-    neighbour = *h264bsdNeighbour4x4BlockD(block);
-    nMb = h264bsdGetNeighbourMb(pMb, neighbour.mb);
-    availableD = h264bsdIsNeighbourAvailable(pMb, nMb);
-    if (availableD && constrainedIntraPred &&
-       ( h264bsdMbPartPredMode(nMb->mbType) == PRED_MODE_INTER) )
-    {
-        availableD = HANTRO_FALSE;
-    }
-
-    x = h264bsdBlockX[block];
-    y = h264bsdBlockY[block];
-
-    if (y == 0)
-        a = ptr - width + x;
-    else
-        a = data-16;
-
-    if (x == 0)
-        l = ptr + y * width -1;
-    else
-    {
-        l = data-1;
-        width = 16;
-    }
-
-    if (x == 0)
-        al = l-width;
-    else
-        al = a-1;
-
-    omxRes = omxVCM4P10_PredictIntra_4x4( l,
-                                          a,
-                                          al,
-                                          data,
-                                          (i32)width,
-                                          16,
-                                          (OMXVCM4P10Intra4x4PredMode)mode,
-                                          (i32)(availableB +
-                                          (availableA<<1) +
-                                          (availableD<<5) +
-                                          (availableC<<6)) );
-    if (omxRes != OMX_Sts_NoErr)
-        return HANTRO_NOK;
-
-    return(HANTRO_OK);
-
-}
-
-/*------------------------------------------------------------------------------
-
-    Function: h264bsdIntraChromaPrediction
-
-        Functional description:
-          Perform intra prediction for chroma pixels and add residual
-          into prediction. The resulting chroma pixels are stored in 'data'.
-
-------------------------------------------------------------------------------*/
-u32 h264bsdIntraChromaPrediction(mbStorage_t *pMb, u8 *data, image_t *image,
-                                        u32 predMode, u32 constrainedIntraPred)
-{
-
-/* Variables */
-
-    u32 availableA, availableB, availableD;
-    OMXResult omxRes;
-    u8 *ptr;
-    u32 width;
-
-/* Code */
-    ASSERT(pMb);
-    ASSERT(data);
-    ASSERT(image);
-    ASSERT(predMode < 4);
-
-    availableA = h264bsdIsNeighbourAvailable(pMb, pMb->mbA);
-    if (availableA && constrainedIntraPred &&
-       (h264bsdMbPartPredMode(pMb->mbA->mbType) == PRED_MODE_INTER))
-        availableA = HANTRO_FALSE;
-    availableB = h264bsdIsNeighbourAvailable(pMb, pMb->mbB);
-    if (availableB && constrainedIntraPred &&
-       (h264bsdMbPartPredMode(pMb->mbB->mbType) == PRED_MODE_INTER))
-        availableB = HANTRO_FALSE;
-    availableD = h264bsdIsNeighbourAvailable(pMb, pMb->mbD);
-    if (availableD && constrainedIntraPred &&
-       (h264bsdMbPartPredMode(pMb->mbD->mbType) == PRED_MODE_INTER))
-        availableD = HANTRO_FALSE;
-
-    ptr = image->cb;
-    width = image->width*8;
-
-    omxRes = omxVCM4P10_PredictIntraChroma_8x8( (ptr-1),
-                                                (ptr - width),
-                                                (ptr - width -1),
-                                                data,
-                                                (i32)width,
-                                                8,
-                                                (OMXVCM4P10IntraChromaPredMode)
-                                                predMode,
-                                                (i32)(availableB +
-                                                 (availableA<<1) +
-                                                 (availableD<<5)) );
-    if (omxRes != OMX_Sts_NoErr)
-        return HANTRO_NOK;
-
-    /* advance pointers */
-    data += 64;
-    ptr = image->cr;
-
-    omxRes = omxVCM4P10_PredictIntraChroma_8x8( (ptr-1),
-                                                (ptr - width),
-                                                (ptr - width -1),
-                                                data,
-                                                (i32)width,
-                                                8,
-                                                (OMXVCM4P10IntraChromaPredMode)
-                                                predMode,
-                                                (i32)(availableB +
-                                                 (availableA<<1) +
-                                                 (availableD<<5)) );
-    if (omxRes != OMX_Sts_NoErr)
-        return HANTRO_NOK;
-
-    return(HANTRO_OK);
-
-}
-
-
-#else /* H264DEC_OMXDL */
 
 
 /*------------------------------------------------------------------------------
@@ -923,7 +666,6 @@ u32 h264bsdIntraChromaPrediction(mbStorage_t *pMb, u8 *data, i32 residual[][16],
           The result (residual + prediction) is stored in 'data'.
 
 ------------------------------------------------------------------------------*/
-#ifndef H264DEC_OMXDL
 void h264bsdAddResidual(u8 *data, i32 *residual, u32 blockNum)
 {
 
@@ -987,7 +729,6 @@ void h264bsdAddResidual(u8 *data, i32 *residual, u32 blockNum)
     }
 
 }
-#endif
 /*------------------------------------------------------------------------------
 
     Function: Intra16x16VerticalPrediction
@@ -1828,8 +1569,6 @@ void Intra4x4HorizontalUpPrediction(u8 *data, u8 *left)
     data[15] = left[3];
 
 }
-
-#endif /* H264DEC_OMXDL */
 
 /*------------------------------------------------------------------------------
 

@@ -173,11 +173,7 @@ extern const u32 h264bsdQpC[52];
 /*------------------------------------------------------------------------------
     4. Function prototypes
 ------------------------------------------------------------------------------*/
-#ifndef H264DEC_NEON
 u32 h264bsdCountLeadingZeros(u32 value, u32 length);
-#else
-u32 h264bsdCountLeadingZeros(u32 value);
-#endif
 u32 h264bsdRbspTrailingBits(strmData_t *strmData);
 
 u32 h264bsdMoreRbspData(strmData_t *strmData);

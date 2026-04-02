@@ -150,11 +150,7 @@ u32 h264bsdDecodeExpGolombUnsigned(strmData_t *pStrmData, u32 *codeNum)
     /* other code lengths */
     else
     {
-#ifndef H264DEC_NEON
         numZeros = 4 + h264bsdCountLeadingZeros(bits, 28);
-#else
-        numZeros = h264bsdCountLeadingZeros(bits);
-#endif
         /* all 32 bits are zero */
         if (numZeros == 32)
         {

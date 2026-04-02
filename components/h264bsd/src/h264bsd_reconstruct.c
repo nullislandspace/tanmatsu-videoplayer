@@ -41,11 +41,6 @@
 #include <stdint.h>
 #endif
 
-#ifdef H264DEC_OMXDL
-#include "omxtypes.h"
-#include "omxVC.h"
-#include "armVC.h"
-#endif /* H264DEC_OMXDL */
 
 /*------------------------------------------------------------------------------
     2. External compiler flags
@@ -72,11 +67,9 @@
  *  G, H, M and N are integer sample positions
  *  a-s are fractional samples that need to be interpolated.
  */
-#ifndef H264DEC_OMXDL
 static const u32 lumaFracPos[4][4] = {
   /* G  d  h  n    a  e  i  p    b  f  j   q     c   g   k   r */
     {0, 1, 2, 3}, {4, 5, 6, 7}, {8, 9, 10, 11}, {12, 13, 14, 15}};
-#endif /* H264DEC_OMXDL */
 
 /* clipping table, defined in h264bsd_intra_prediction.c */
 extern const u8 h264bsdClip[];
@@ -84,8 +77,6 @@ extern const u8 h264bsdClip[];
 /*------------------------------------------------------------------------------
     4. Local function prototypes
 ------------------------------------------------------------------------------*/
-
-#ifndef H264DEC_OMXDL
 
 /*------------------------------------------------------------------------------
 
@@ -109,7 +100,6 @@ extern const u8 h264bsdClip[];
           predPartChroma    pointer where predicted part is written
 
 ------------------------------------------------------------------------------*/
-#ifndef H264DEC_ARM11
 void h264bsdInterpolateChromaHor(
   u8 *pRef,
   u8 *predPartChroma,
@@ -289,7 +279,6 @@ void h264bsdInterpolateChromaVer(
     }
 
 }
-#endif
 /*------------------------------------------------------------------------------
 
     Function: h264bsdInterpolateChromaHorVer
@@ -490,7 +479,6 @@ static void PredictChroma(
           is written to macroblock array (mb)
 
 ------------------------------------------------------------------------------*/
-#ifndef H264DEC_ARM11
 
 #ifdef CONFIG_USE_SIMD_OPTIMIZATIONS
 /*
@@ -1355,7 +1343,6 @@ void h264bsdInterpolateHorVerQuarter(
     }
 
 }
-#endif
 
 /*------------------------------------------------------------------------------
 
@@ -2102,186 +2089,6 @@ void h264bsdPredictSamples(
 
 }
 
-#else /* H264DEC_OMXDL */
-/*------------------------------------------------------------------------------
-
-    Function: h264bsdPredictSamples
-
-        Functional description:
-          This function reconstructs a prediction for a macroblock partition.
-          The prediction is either copied or interpolated using the reference
-          frame and the motion vector. Both luminance and chrominance parts are
-          predicted. The prediction is stored in given macroblock array (data).
-        Inputs:
-          data          pointer to macroblock array (384 bytes) for output
-          mv            pointer to motion vector used for prediction
-          refPic        pointer to reference picture structure
-          xA            x-coordinate for current macroblock
-          yA            y-coordinate for current macroblock
-          partX         x-offset for partition in macroblock
-          partY         y-offset for partition in macroblock
-          partWidth     width of partition
-          partHeight    height of partition
-        Outputs:
-          data          macroblock array (16x16+8x8+8x8) where predicted
-                        partition is stored at correct position
-
-------------------------------------------------------------------------------*/
-
-/*lint -e{550} Symbol 'res' not accessed */
-void h264bsdPredictSamples(
-  u8 *data,
-  mv_t *mv,
-  image_t *refPic,
-  u32 colAndRow,
-  u32 part,
-  u8 *pFill)
-
-{
-
-/* Variables */
-
-    u32 xFrac, yFrac;
-    u32 width, height;
-    i32 xInt, yInt, x0, y0;
-    u8 *partData, *ref;
-    OMXSize roi;
-    u32 fillWidth;
-    u32 fillHeight;
-    OMXResult res;
-    u32 xA, yA;
-    u32 partX, partY;
-    u32 partWidth, partHeight;
-
-/* Code */
-
-    ASSERT(data);
-    ASSERT(mv);
-    ASSERT(refPic);
-    ASSERT(refPic->data);
-    ASSERT(refPic->width);
-    ASSERT(refPic->height);
-
-    xA = (colAndRow & 0xFFFF0000) >> 16;
-    yA = (colAndRow & 0x0000FFFF);
-
-    partX = (part & 0xFF000000) >> 24;
-    partY = (part & 0x00FF0000) >> 16;
-    partWidth = (part & 0x0000FF00) >> 8;
-    partHeight = (part & 0x000000FF);
-
-    ASSERT(partWidth);
-    ASSERT(partHeight);
-
-    /* luma */
-    partData = data + 16*partY + partX;
-
-    xFrac = mv->hor & 0x3;
-    yFrac = mv->ver & 0x3;
-
-    width = 16 * refPic->width;
-    height = 16 * refPic->height;
-
-    xInt = (i32)xA + (i32)partX + (mv->hor >> 2);
-    yInt = (i32)yA + (i32)partY + (mv->ver >> 2);
-
-    x0 = (xFrac) ? xInt-2 : xInt;
-    y0 = (yFrac) ? yInt-2 : yInt;
-
-    if (xFrac)
-    {
-        if (partWidth == 16)
-            fillWidth = 32;
-        else
-            fillWidth = 16;
-    }
-    else
-        fillWidth = (partWidth*2);
-    if (yFrac)
-        fillHeight = partHeight+5;
-    else
-        fillHeight = partHeight;
-
-
-    if ((x0 < 0) || ((u32)x0+fillWidth > width) ||
-        (y0 < 0) || ((u32)y0+fillHeight > height))
-    {
-        h264bsdFillBlock(refPic->data, (u8*)pFill, x0, y0, width, height,
-                fillWidth, fillHeight, fillWidth);
-
-        x0 = 0;
-        y0 = 0;
-        ref = pFill;
-        width = fillWidth;
-        if (yFrac)
-            ref += 2*width;
-        if (xFrac)
-            ref += 2;
-    }
-    else
-    {
-        /*lint --e(737) Loss of sign */
-        ref = refPic->data + yInt*width + xInt;
-    }
-    /* Luma interpolation */
-    roi.width = (i32)partWidth;
-    roi.height = (i32)partHeight;
-
-    res = omxVCM4P10_InterpolateLuma(ref, (i32)width, partData, 16,
-                                        (i32)xFrac, (i32)yFrac, roi);
-    ASSERT(res == 0);
-
-    /* Chroma */
-    width  = 8 * refPic->width;
-    height = 8 * refPic->height;
-
-    x0 = ((xA + partX) >> 1) + (mv->hor >> 3);
-    y0 = ((yA + partY) >> 1) + (mv->ver >> 3);
-    xFrac = mv->hor & 0x7;
-    yFrac = mv->ver & 0x7;
-
-    ref = refPic->data + 256 * refPic->width * refPic->height;
-
-    roi.width = (i32)(partWidth >> 1);
-    fillWidth = ((partWidth >> 1) + 8) & ~0x7;
-    roi.height = (i32)(partHeight >> 1);
-    fillHeight = (partHeight >> 1) + 1;
-
-    if ((x0 < 0) || ((u32)x0+fillWidth > width) ||
-        (y0 < 0) || ((u32)y0+fillHeight > height))
-    {
-        h264bsdFillBlock(ref, pFill, x0, y0, width, height,
-            fillWidth, fillHeight, fillWidth);
-        ref += width * height;
-        h264bsdFillBlock(ref, pFill + fillWidth*fillHeight,
-            x0, y0, width, height, fillWidth,
-            fillHeight, fillWidth);
-
-        ref = pFill;
-        x0 = 0;
-        y0 = 0;
-        width = fillWidth;
-        height = fillHeight;
-    }
-
-    partData = data + 16*16 + (partY>>1)*8 + (partX>>1);
-
-    /* Chroma interpolation */
-    /*lint --e(737) Loss of sign */
-    ref += y0 * width + x0;
-    res = armVCM4P10_Interpolate_Chroma(ref, width, partData, 8,
-                            (u32)roi.width, (u32)roi.height, xFrac, yFrac);
-    ASSERT(res == 0);
-    partData += 8 * 8;
-    ref += height * width;
-    res = armVCM4P10_Interpolate_Chroma(ref, width, partData, 8,
-                            (u32)roi.width, (u32)roi.height, xFrac, yFrac);
-    ASSERT(res == 0);
-
-}
-
-#endif /* H264DEC_OMXDL */
-
 
 /*------------------------------------------------------------------------------
 
@@ -2351,7 +2158,6 @@ static void FillRow1(
           fill      pointer where samples are stored
 
 ------------------------------------------------------------------------------*/
-#ifndef H264DEC_NEON
 void h264bsdFillRow7(
   u8 *ref,
   u8 *fill,
@@ -2381,7 +2187,6 @@ void h264bsdFillRow7(
         /*lint -esym(644,tmp)  tmp is initialized if used */
         *fill++ = tmp;
 }
-#endif
 /*------------------------------------------------------------------------------
 
     Function: h264bsdFillBlock

@@ -48,7 +48,6 @@
 /*------------------------------------------------------------------------------
     4. Function prototypes
 ------------------------------------------------------------------------------*/
-#ifndef H264DEC_OMXDL
 u32 h264bsdIntraPrediction(mbStorage_t *pMb, macroblockLayer_t *mbLayer,
     image_t *image, u32 mbNum, u32 constrainedIntraPred, u8 *data);
 
@@ -62,21 +61,6 @@ u32 h264bsdIntraChromaPrediction(mbStorage_t *pMb, u8 *data, i32 residual[][16],
     u8 *above, u8 *left, u32 predMode, u32 constrainedIntraPred);
 
 void h264bsdGetNeighbourPels(image_t *image, u8 *above, u8 *left, u32 mbNum);
-
-#else
-
-u32 h264bsdIntra4x4Prediction(mbStorage_t *pMb, u8 *data,
-                              macroblockLayer_t *mbLayer,
-                              u8 *pImage, u32 width,
-                              u32 constrainedIntraPred, u32 block);
-
-u32 h264bsdIntra16x16Prediction(mbStorage_t *pMb, u8 *data, u8 *pImage,
-                            u32 width, u32 constrainedIntraPred);
-
-u32 h264bsdIntraChromaPrediction(mbStorage_t *pMb, u8 *data, image_t *image,
-                                        u32 predMode, u32 constrainedIntraPred);
-
-#endif
 
 #endif /* #ifdef H264SWDEC_INTRA_PREDICTION_H */
 

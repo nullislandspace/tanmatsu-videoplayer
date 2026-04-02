@@ -282,10 +282,6 @@ u32 ConcealMb(mbStorage_t *pMb, image_t *currImage, u32 row, u32 col,
     /* neighbours above, below, left and right */
     i32 a[4] = { 0,0,0,0 }, b[4], l[4] = { 0,0,0,0 }, r[4];
     u32 A, B, L, R;
-#ifdef H264DEC_OMXDL
-    u8 fillBuff[32*21 + 15 + 32];
-    u8 *pFill;
-#endif
 /* Code */
 
     ASSERT(pMb);
@@ -294,9 +290,6 @@ u32 ConcealMb(mbStorage_t *pMb, image_t *currImage, u32 row, u32 col,
     ASSERT(col < currImage->width);
     ASSERT(row < currImage->height);
 
-#ifdef H264DEC_OMXDL
-    pFill = ALIGN(fillBuff, 16);
-#endif
     width = currImage->width;
     height = currImage->height;
     mbNum = row * width + col;
@@ -327,14 +320,8 @@ u32 ConcealMb(mbStorage_t *pMb, image_t *currImage, u32 row, u32 col,
         refImage.data = refData;
         if (refImage.data)
         {
-#ifndef H264DEC_OMXDL
             h264bsdPredictSamples(data, &mv, &refImage, col*16, row*16,
                 0, 0, 16, 16);
-#else
-            h264bsdPredictSamples(data, &mv, &refImage,
-                    ((row*16) + ((col*16)<<16)),
-                    0x00001010, pFill);
-#endif
             h264bsdWriteMacroblock(currImage, data);
 
             return(HANTRO_OK);

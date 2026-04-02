@@ -77,7 +77,6 @@ extern const u8 h264bsdClip[];
             none
 
 ------------------------------------------------------------------------------*/
-#ifndef H264DEC_NEON
 void h264bsdWriteMacroblock(image_t *image, u8 *data)
 {
 
@@ -142,8 +141,6 @@ void h264bsdWriteMacroblock(image_t *image, u8 *data)
     }
 
 }
-#endif
-#ifndef H264DEC_OMXDL
 /*------------------------------------------------------------------------------
 
     Function: h264bsdWriteOutputBlocks
@@ -342,5 +339,4 @@ void h264bsdWriteOutputBlocks(image_t *image, u32 mbNum, u8 *data,
     }
 
 }
-#endif /* H264DEC_OMXDL */
 

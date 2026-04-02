@@ -22,3 +22,6 @@ components/badgeteam__badgelink/
 components/pax-gfx/
 .vscode
 badgelink
+test/test_decode
+test/*.h264
+test/*.i420
