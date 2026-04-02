@@ -254,6 +254,8 @@ u32 h264bsdDecode(storage_t *pStorage, u8 *byteStrm, u32 len, u32 picId,
             {
                 pStorage->currImage->data =
                     h264bsdAllocateDpbImage(pStorage->dpb);
+                pStorage->currImage->ppa_data = pStorage->dpb->currentOut->ppa_data;
+                pStorage->currImage->ppa_stride = pStorage->dpb->ppaStride;
                 h264bsdInitRefPicList(pStorage->dpb);
                 tmp = h264bsdConceal(pStorage, pStorage->currImage, P_SLICE);
             }
@@ -432,6 +434,8 @@ u32 h264bsdDecode(storage_t *pStorage, u8 *byteStrm, u32 len, u32 picId,
                     }
                     pStorage->currImage->data =
                         h264bsdAllocateDpbImage(pStorage->dpb);
+                    pStorage->currImage->ppa_data = pStorage->dpb->currentOut->ppa_data;
+                    pStorage->currImage->ppa_stride = pStorage->dpb->ppaStride;
                 }
 
                 /* store slice header to storage if successfully decoded */
@@ -484,6 +488,7 @@ u32 h264bsdDecode(storage_t *pStorage, u8 *byteStrm, u32 len, u32 picId,
     if (picReady)
     {
         h264bsdFilterPicture(pStorage->currImage, pStorage->mb);
+        h264bsdConvertImageToPpa(pStorage->currImage);
 
         h264bsdResetStorage(pStorage);
 
@@ -620,7 +625,7 @@ u8* h264bsdNextOutputPicture(storage_t *pStorage, u32 *picId, u32 *isIdrPic,
     ASSERT(pStorage);
 
     pOut = h264bsdDpbOutputPicture(pStorage->dpb);
-    
+
     if (pOut != NULL)
     {
         *picId = pOut->picId;
@@ -631,6 +636,34 @@ u8* h264bsdNextOutputPicture(storage_t *pStorage, u32 *picId, u32 *isIdrPic,
     else
         return(NULL);
 
+}
+
+/*------------------------------------------------------------------------------
+
+    Function: h264bsdNextOutputPicturePpa
+
+        Functional description:
+            Get the PPA-packed YUV420 buffer for the most recently returned
+            output picture. Must be called immediately after
+            h264bsdNextOutputPicture.
+
+        Returns:
+            pointer to PPA-packed buffer, or NULL
+
+------------------------------------------------------------------------------*/
+
+u8* h264bsdNextOutputPicturePpa(storage_t *pStorage, u32 *ppaStride)
+{
+    ASSERT(pStorage);
+
+    /* The outIndex was already incremented by the previous
+     * h264bsdNextOutputPicture call, so the last output is at outIndex-1 */
+    if (pStorage->dpb->outIndex > 0)
+    {
+        *ppaStride = pStorage->dpb->ppaStride;
+        return pStorage->dpb->outBuf[pStorage->dpb->outIndex - 1].ppa_data;
+    }
+    return NULL;
 }
 
 

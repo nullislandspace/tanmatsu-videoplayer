@@ -26,6 +26,12 @@ uint8_t* yuv_convert_get_output_buffer(void);
 // Request a one-shot dump of the YUV input and PPA output to SD card
 void yuv_convert_request_dump(void);
 
+// Convert pre-formatted PPA-packed YUV420 to framebuffer (skips I420→PPA reformat)
+esp_err_t ppa_to_framebuffer(uint8_t* ppa_in, int ppa_stride,
+                              uint8_t* fb_out,
+                              int visible_width, int visible_height,
+                              int display_width, int display_height);
+
 // Get last frame's reformat time (I420 → PPA-packed) in microseconds
 uint32_t yuv_convert_get_reformat_us(void);
 

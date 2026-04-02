@@ -181,7 +181,7 @@ static void Intra4x4VerticalRightPrediction(u8 *data, u8 *above, u8 *left);
 static void Intra4x4HorizontalDownPrediction(u8 *data, u8 *above, u8 *left);
 static void Intra4x4VerticalLeftPrediction(u8 *data, u8 *above);
 static void Intra4x4HorizontalUpPrediction(u8 *data, u8 *left);
-void h264bsdAddResidual(u8 *data, i32 *residual, u32 blockNum);
+void h264bsdAddResidual(u8 *data, i16 *residual, u32 blockNum);
 
 static void Write4x4To16x16(u8 *data, u8 *data4x4, u32 blockNum);
 
@@ -245,7 +245,7 @@ u32 h264bsdIntraPrediction(mbStorage_t *pMb, macroblockLayer_t *mbLayer,
 
     if (h264bsdMbPartPredMode(pMb->mbType) == PRED_MODE_INTRA16x16)
     {
-        tmp = h264bsdIntra16x16Prediction(pMb, data, mbLayer->residual.level,
+        tmp = h264bsdIntra16x16Prediction(pMb, data, mbLayer->residual.levelI16,
             pelAbove, pelLeft, constrainedIntraPred);
         if (tmp != HANTRO_OK)
             return(tmp);
@@ -259,7 +259,7 @@ u32 h264bsdIntraPrediction(mbStorage_t *pMb, macroblockLayer_t *mbLayer,
     }
 
     tmp = h264bsdIntraChromaPrediction(pMb, data + 256,
-            mbLayer->residual.level+16, pelAbove + 21, pelLeft + 16,
+            mbLayer->residual.levelI16+16, pelAbove + 21, pelLeft + 16,
             mbLayer->mbPred.intraChromaPredMode, constrainedIntraPred);
     if (tmp != HANTRO_OK)
         return(tmp);
@@ -367,7 +367,7 @@ void h264bsdGetNeighbourPels(image_t *image, u8 *above, u8 *left, u32 mbNum)
 
 ------------------------------------------------------------------------------*/
 
-u32 h264bsdIntra16x16Prediction(mbStorage_t *pMb, u8 *data, i32 residual[][16],
+u32 h264bsdIntra16x16Prediction(mbStorage_t *pMb, u8 *data, i16 residual[][16],
                                 u8 *above, u8 *left, u32 constrainedIntraPred)
 {
 
@@ -568,7 +568,7 @@ u32 h264bsdIntra4x4Prediction(mbStorage_t *pMb, u8 *data,
         }
 
         Write4x4To16x16(data, (u8*)data4x4, block);
-        h264bsdAddResidual(data, mbLayer->residual.level[block], block);
+        h264bsdAddResidual(data, mbLayer->residual.levelI16[block], block);
     }
 
     return(HANTRO_OK);
@@ -585,7 +585,7 @@ u32 h264bsdIntra4x4Prediction(mbStorage_t *pMb, u8 *data,
 
 ------------------------------------------------------------------------------*/
 
-u32 h264bsdIntraChromaPrediction(mbStorage_t *pMb, u8 *data, i32 residual[][16],
+u32 h264bsdIntraChromaPrediction(mbStorage_t *pMb, u8 *data, i16 residual[][16],
                     u8 *above, u8 *left, u32 predMode, u32 constrainedIntraPred)
 {
 
@@ -666,7 +666,18 @@ u32 h264bsdIntraChromaPrediction(mbStorage_t *pMb, u8 *data, i32 residual[][16],
           The result (residual + prediction) is stored in 'data'.
 
 ------------------------------------------------------------------------------*/
-void h264bsdAddResidual(u8 *data, i32 *residual, u32 blockNum)
+/*
+ * SIMD CANDIDATE: h264bsdAddResidual
+ *
+ * Adds i16 residual to u8 prediction in-place for one 4x4 block.
+ * Input:  data — u8 prediction buffer, stride 16 (luma) or 8 (chroma)
+ *         residual[16] — i16, block-order (4 rows x 4 cols sequential)
+ * Output: data — u8, prediction + residual clipped to [0,255]
+ *
+ * Small working set (16 pixels). SIMD marginal due to 4-pixel width
+ * not filling 128-bit register. Better to batch multiple blocks if possible.
+ */
+void h264bsdAddResidual(u8 *data, i16 *residual, u32 blockNum)
 {
 
 /* Variables */
@@ -684,10 +695,8 @@ void h264bsdAddResidual(u8 *data, i32 *residual, u32 blockNum)
     ASSERT(residual);
     ASSERT(blockNum < 16 + 4 + 4);
 
-    if (IS_RESIDUAL_EMPTY(residual))
+    if (IS_RESIDUAL_EMPTY_I16(residual))
         return;
-
-    RANGE_CHECK_ARRAY(residual, -512, 511, 16);
 
     if (blockNum < 16)
     {

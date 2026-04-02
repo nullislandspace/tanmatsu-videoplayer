@@ -52,6 +52,9 @@ typedef struct
     u8 *luma;
     u8 *cb;
     u8 *cr;
+    /* PPA-packed YUV420 output buffer for display */
+    u8 *ppa_data;
+    u32 ppa_stride;     /* bytes per row in PPA buffer */
 } image_t;
 
 /*------------------------------------------------------------------------------
@@ -59,9 +62,15 @@ typedef struct
 ------------------------------------------------------------------------------*/
 
 void h264bsdWriteMacroblock(image_t *image, u8 *data);
+void h264bsdConvertImageToPpa(image_t *image);
+
+/* Forward declaration to avoid circular include with h264bsd_macroblock_layer.h */
+struct residual_tag;
+
+void h264bsdReorderResidualToRows(struct residual_tag *pResidual);
 
 void h264bsdWriteOutputBlocks(image_t *image, u32 mbNum, u8 *data,
-    i32 residual[][16]);
+    struct residual_tag *pResidual);
 
 #endif /* #ifdef H264SWDEC_IMAGE_H */
 

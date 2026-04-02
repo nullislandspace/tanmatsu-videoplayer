@@ -372,6 +372,7 @@ u32 h264bsdActivateParamSets(storage_t *pStorage, u32 ppsId, u32 isIdr)
         tmp = h264bsdResetDpb(pStorage->dpb,
             pStorage->activeSps->picWidthInMbs *
             pStorage->activeSps->picHeightInMbs,
+            pStorage->activeSps->picWidthInMbs,
             pStorage->activeSps->maxDpbSize,
             pStorage->activeSps->numRefFrames,
             pStorage->activeSps->maxFrameNum,

@@ -41,12 +41,14 @@ esp_err_t video_decoder_init(int max_width, int max_height) {
 }
 
 esp_err_t video_decoder_decode(uint8_t* nal_data, size_t nal_size,
-                               uint8_t** yuv_out, int* width, int* height) {
+                               uint8_t** yuv_out, int* width, int* height,
+                               uint8_t** ppa_out, uint32_t* ppa_stride) {
     if (!decoder || !nal_data || nal_size == 0) {
         return ESP_ERR_INVALID_ARG;
     }
 
     *yuv_out = NULL;
+    if (ppa_out) *ppa_out = NULL;
     u32 readBytes = 0;
     u8* remaining = nal_data;
     u32 remaining_len = nal_size;
@@ -71,6 +73,11 @@ esp_err_t video_decoder_decode(uint8_t* nal_data, size_t nal_size,
                     *width = h264bsdPicWidth(decoder) * 16;
                     *height = h264bsdPicHeight(decoder) * 16;
                     *yuv_out = pic;
+                    if (ppa_out && ppa_stride) {
+                        u32 stride = 0;
+                        *ppa_out = h264bsdNextOutputPicturePpa(decoder, &stride);
+                        *ppa_stride = stride;
+                    }
                     pic_id++;
 
                     static bool first_frame = true;

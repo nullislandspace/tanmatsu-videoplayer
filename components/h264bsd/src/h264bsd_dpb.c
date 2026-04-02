@@ -807,9 +807,10 @@ u32 h264bsdMarkDecRefPic(
     {
         ASSERT(dpb->numOut == 0);
         ASSERT(dpb->outIndex == 0);
-        dpb->outBuf[dpb->numOut].data  = dpb->currentOut->data;
-        dpb->outBuf[dpb->numOut].isIdr = dpb->currentOut->isIdr;
-        dpb->outBuf[dpb->numOut].picId = dpb->currentOut->picId;
+        dpb->outBuf[dpb->numOut].data     = dpb->currentOut->data;
+        dpb->outBuf[dpb->numOut].ppa_data = dpb->currentOut->ppa_data;
+        dpb->outBuf[dpb->numOut].isIdr    = dpb->currentOut->isIdr;
+        dpb->outBuf[dpb->numOut].picId    = dpb->currentOut->picId;
         dpb->outBuf[dpb->numOut].numErrMbs = dpb->currentOut->numErrMbs;
         dpb->numOut++;
     }
@@ -981,6 +982,7 @@ static u32 SlidingWindowRefPicMarking(dpbStorage_t *dpb)
 u32 h264bsdInitDpb(
   dpbStorage_t *dpb,
   u32 picSizeInMbs,
+  u32 picWidthInMbs,
   u32 dpbSize,
   u32 maxRefFrames,
   u32 maxFrameNum,
@@ -1028,7 +1030,21 @@ u32 h264bsdInitDpb(
             return(MEMORY_ALLOCATION_ERROR);
 
         dpb->buffer[i].data = ALIGN(dpb->buffer[i].pAllocatedData, 16);
+
+        /* PPA-packed YUV420 buffer: 1.5 bytes per pixel, same total as I420 */
+        {
+            u32 ppaSize = picSizeInMbs * 384; /* same byte count as I420 */
+            ALLOCATE(dpb->buffer[i].pAllocatedPpaData, ppaSize + 15, u8);
+            if (dpb->buffer[i].pAllocatedPpaData == NULL)
+                return(MEMORY_ALLOCATION_ERROR);
+            dpb->buffer[i].ppa_data = ALIGN(dpb->buffer[i].pAllocatedPpaData, 16);
+        }
     }
+
+    /* Store pixel dimensions for PPA stride calculation */
+    dpb->picWidthInPixels = picWidthInMbs * 16;
+    dpb->picHeightInPixels = (picSizeInMbs / picWidthInMbs) * 16;
+    dpb->ppaStride = dpb->picWidthInPixels * 3 / 2;
 
     ALLOCATE(dpb->list, MAX_NUM_REF_IDX_L0_ACTIVE + 1, dpbPicture_t*);
     ALLOCATE(dpb->outBuf, dpb->dpbSize+1, dpbOutPicture_t);
@@ -1061,6 +1077,7 @@ u32 h264bsdInitDpb(
 u32 h264bsdResetDpb(
   dpbStorage_t *dpb,
   u32 picSizeInMbs,
+  u32 picWidthInMbs,
   u32 dpbSize,
   u32 maxRefFrames,
   u32 maxFrameNum,
@@ -1077,8 +1094,8 @@ u32 h264bsdResetDpb(
 
     h264bsdFreeDpb(dpb);
 
-    return h264bsdInitDpb(dpb, picSizeInMbs, dpbSize, maxRefFrames,
-                          maxFrameNum, noReordering);
+    return h264bsdInitDpb(dpb, picSizeInMbs, picWidthInMbs, dpbSize,
+                          maxRefFrames, maxFrameNum, noReordering);
 }
 
 /*------------------------------------------------------------------------------
@@ -1250,6 +1267,7 @@ u32 h264bsdCheckGapsInFrameNum(dpbStorage_t *dpb, u32 frameNum, u32 isRefPic,
 
     u32 unUsedShortTermFrameNum;
     u8 *tmp;
+    u8 *tmpPpa;
 
 /* Code */
 
@@ -1274,6 +1292,7 @@ u32 h264bsdCheckGapsInFrameNum(dpbStorage_t *dpb, u32 frameNum, u32 isRefPic,
          * contains data pointer located in outBuf (buffer placed in the output
          * shall not be overwritten by the current picture) */
         tmp = dpb->buffer[dpb->dpbSize].data;
+        tmpPpa = dpb->buffer[dpb->dpbSize].ppa_data;
         do
         {
             SetPicNums(dpb, unUsedShortTermFrameNum);
@@ -1333,7 +1352,10 @@ u32 h264bsdCheckGapsInFrameNum(dpbStorage_t *dpb, u32 frameNum, u32 isRefPic,
                         {
                             dpb->buffer[i].data =
                                 dpb->buffer[dpb->dpbSize].data;
+                            dpb->buffer[i].ppa_data =
+                                dpb->buffer[dpb->dpbSize].ppa_data;
                             dpb->buffer[dpb->dpbSize].data = tmp;
+                            dpb->buffer[dpb->dpbSize].ppa_data = tmpPpa;
                             break;
                         }
                     }
@@ -1441,9 +1463,10 @@ u32 OutputPicture(dpbStorage_t *dpb)
     if (tmp == NULL)
         return(HANTRO_NOK);
 
-    dpb->outBuf[dpb->numOut].data  = tmp->data;
-    dpb->outBuf[dpb->numOut].isIdr = tmp->isIdr;
-    dpb->outBuf[dpb->numOut].picId = tmp->picId;
+    dpb->outBuf[dpb->numOut].data     = tmp->data;
+    dpb->outBuf[dpb->numOut].ppa_data = tmp->ppa_data;
+    dpb->outBuf[dpb->numOut].isIdr    = tmp->isIdr;
+    dpb->outBuf[dpb->numOut].picId    = tmp->picId;
     dpb->outBuf[dpb->numOut].numErrMbs = tmp->numErrMbs;
     dpb->numOut++;
 
@@ -1537,6 +1560,7 @@ void h264bsdFreeDpb(dpbStorage_t *dpb)
         for (i = 0; i < dpb->dpbSize+1; i++)
         {
             FREE(dpb->buffer[i].pAllocatedData);
+            FREE(dpb->buffer[i].pAllocatedPpaData);
         }
     }
     FREE(dpb->buffer);

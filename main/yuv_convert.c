@@ -277,6 +277,90 @@ uint8_t* yuv_convert_get_output_buffer(void) {
     return NULL;  // PPA writes directly to framebuffer
 }
 
+esp_err_t ppa_to_framebuffer(uint8_t* ppa_in, int ppa_stride,
+                              uint8_t* fb_out,
+                              int visible_width, int visible_height,
+                              int display_width, int display_height) {
+    if (!ppa_client || !ppa_in || !fb_out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    last_reformat_us = 0;  // No reformat needed
+
+    // Flush PPA input to PSRAM for DMA
+    size_t yuv_packed_size = (size_t)ppa_stride * visible_height;
+    size_t yuv_aligned = (yuv_packed_size + PPA_CACHE_LINE - 1) & ~(PPA_CACHE_LINE - 1);
+    esp_cache_msync(ppa_in, yuv_aligned, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+
+    // PPA YUV→RGB + 270° rotation + scaling
+    int fb_w = display_height;
+    int fb_h = display_width;
+
+    float scale_x = (float)fb_h / visible_width;
+    float scale_y = (float)fb_w / visible_height;
+    float scale = (scale_x < scale_y) ? scale_x : scale_y;
+    if (scale > 1.0f && visible_width >= fb_h && visible_height >= fb_w) {
+        scale = 1.0f;
+    }
+
+    int out_block_w = (int)(visible_height * scale);
+    int out_block_h = (int)(visible_width * scale);
+
+    int offset_x = (fb_w - out_block_w) / 2;
+    int offset_y = (fb_h - out_block_h) / 2;
+    if (offset_x < 0) offset_x = 0;
+    if (offset_y < 0) offset_y = 0;
+    offset_x &= ~1;
+    offset_y &= ~1;
+
+    size_t fb_size = (size_t)fb_w * fb_h * 3;
+    size_t fb_size_aligned = (fb_size + PPA_CACHE_LINE - 1) & ~(PPA_CACHE_LINE - 1);
+    esp_cache_msync(fb_out, fb_size_aligned, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+
+    int64_t t_ppa_start = esp_timer_get_time();
+
+    ppa_srm_oper_config_t srm = {
+        .in = {
+            .buffer = ppa_in,
+            .pic_w = visible_width,
+            .pic_h = visible_height,
+            .block_w = visible_width,
+            .block_h = visible_height,
+            .block_offset_x = 0,
+            .block_offset_y = 0,
+            .srm_cm = PPA_SRM_COLOR_MODE_YUV420,
+            .yuv_range = PPA_COLOR_RANGE_LIMIT,
+            .yuv_std = PPA_COLOR_CONV_STD_RGB_YUV_BT601,
+        },
+        .out = {
+            .buffer = fb_out,
+            .buffer_size = fb_size_aligned,
+            .pic_w = fb_w,
+            .pic_h = fb_h,
+            .block_offset_x = offset_x,
+            .block_offset_y = offset_y,
+            .srm_cm = PPA_SRM_COLOR_MODE_RGB888,
+        },
+        .rotation_angle = PPA_SRM_ROTATION_ANGLE_270,
+        .scale_x = scale,
+        .scale_y = scale,
+        .mode = PPA_TRANS_MODE_BLOCKING,
+    };
+
+    esp_err_t ret = ppa_do_scale_rotate_mirror(ppa_client, &srm);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "PPA failed: %s (scale=%.2f, in=%dx%d)",
+                 esp_err_to_name(ret), scale, visible_width, visible_height);
+        return ret;
+    }
+
+    esp_cache_msync(fb_out, fb_size_aligned, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+
+    last_ppa_us = (uint32_t)(esp_timer_get_time() - t_ppa_start);
+
+    return ESP_OK;
+}
+
 uint32_t yuv_convert_get_reformat_us(void) {
     return last_reformat_us;
 }

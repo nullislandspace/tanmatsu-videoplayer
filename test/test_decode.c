@@ -111,6 +111,61 @@ int main(int argc, char *argv[])
                     u32 chroma_size = luma_size / 4;
                     u32 frame_size = luma_size + 2 * chroma_size;
                     fwrite(pic, 1, frame_size, fout);
+
+                    /* Verify PPA output against reference conversion */
+                    u32 ppa_stride = 0;
+                    u8 *ppa = h264bsdNextOutputPicturePpa(decoder, &ppa_stride);
+                    if (ppa && ppa_stride > 0) {
+                        u8 *y_plane = pic;
+                        u8 *u_plane = pic + luma_size;
+                        u8 *v_plane = u_plane + chroma_size;
+                        u32 uv_stride = pic_width / 2;
+                        int ppa_ok = 1;
+
+                        for (u32 r = 0; r < pic_height && ppa_ok; r++) {
+                            const u8 *y_row = y_plane + r * pic_width;
+                            const u8 *c_row = (r & 1)
+                                ? v_plane + (r >> 1) * uv_stride
+                                : u_plane + (r >> 1) * uv_stride;
+                            u8 *ppa_row = ppa + r * ppa_stride;
+
+                            for (u32 x = 0; x + 7 < pic_width; x += 8) {
+                                u32 cx = x >> 1;
+                                u8 ref[12];
+                                ref[0]  = c_row[cx + 0];
+                                ref[1]  = y_row[x + 0];
+                                ref[2]  = y_row[x + 1];
+                                ref[3]  = c_row[cx + 1];
+                                ref[4]  = y_row[x + 2];
+                                ref[5]  = y_row[x + 3];
+                                ref[6]  = c_row[cx + 2];
+                                ref[7]  = y_row[x + 4];
+                                ref[8]  = y_row[x + 5];
+                                ref[9]  = c_row[cx + 3];
+                                ref[10] = y_row[x + 6];
+                                ref[11] = y_row[x + 7];
+
+                                u8 *ppa_pos = ppa_row + (x * 3 / 2);
+                                if (memcmp(ref, ppa_pos, 12) != 0) {
+                                    if (ppa_ok) { /* only print first mismatch per frame */
+                                        fprintf(stderr, "PPA MISMATCH: frame %u, row %u, x %u\n",
+                                                frame_count, r, x);
+                                        fprintf(stderr, "  ref: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                                                ref[0],ref[1],ref[2],ref[3],ref[4],ref[5],
+                                                ref[6],ref[7],ref[8],ref[9],ref[10],ref[11]);
+                                        fprintf(stderr, "  got: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                                                ppa_pos[0],ppa_pos[1],ppa_pos[2],ppa_pos[3],
+                                                ppa_pos[4],ppa_pos[5],ppa_pos[6],ppa_pos[7],
+                                                ppa_pos[8],ppa_pos[9],ppa_pos[10],ppa_pos[11]);
+                                    }
+                                    ppa_ok = 0;
+                                }
+                            }
+                        }
+                        if (ppa_ok && frame_count == 0)
+                            fprintf(stderr, "PPA verification: OK (first frame)\n");
+                    }
+
                     frame_count++;
                     pic_id++;
 

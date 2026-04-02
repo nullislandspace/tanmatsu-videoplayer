@@ -305,8 +305,9 @@ u32 h264bsdInterPrediction(mbStorage_t *pMb, macroblockLayer_t *pMbLayer,
 
     if (pMb->mbType != P_Skip)
     {
+        h264bsdReorderResidualToRows(&pMbLayer->residual);
         h264bsdWriteOutputBlocks(currImage, mbNum, data,
-            pMbLayer->residual.level);
+            &pMbLayer->residual);
     }
     else
     {

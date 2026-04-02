@@ -137,11 +137,17 @@ typedef struct
     mv_t mvdL0[4][4];
 } subMbPred_t;
 
-typedef struct
+typedef struct residual_tag
 {
     i16 totalCoeff[27];
-    i32 level[26][16];
+    i32 level[26][16];          /* CAVLC decode + transform workspace (i32) */
     u32 coeffMap[24];
+    i16 levelI16[24][16];       /* narrowed i16 residuals, block-order */
+    /* Row-ordered residuals for SIMD-friendly access in WriteOutputBlocks.
+     * lumaRows: 16 rows of 16 contiguous i16 pixels (one full MB row).
+     * chromaRows: 2 planes (Cb, Cr) of 8 rows of 8 contiguous i16 pixels. */
+    i16 lumaRows[16][16] __attribute__((aligned(16)));
+    i16 chromaRows[2][8][8] __attribute__((aligned(16)));
 } residual_t;
 
 typedef struct

@@ -339,16 +339,25 @@ static bool process_video_frame(uint8_t* fb_pixels, int fb_stride, int fb_height
         }
     } else if (active_codec == AVI_CODEC_H264) {
         uint8_t* yuv_out = NULL;
-        ret = video_decoder_decode(frame_data, frame->size, &yuv_out, &width, &height);
+        uint8_t* ppa_out = NULL;
+        uint32_t ppa_stride = 0;
+        ret = video_decoder_decode(frame_data, frame->size, &yuv_out, &width, &height,
+                                   &ppa_out, &ppa_stride);
         video_read_idx = (video_read_idx + 1) % VIDEO_BUFFER_FRAMES;
         video_buffered--;
         if (ret == ESP_OK && yuv_out) {
             int64_t t1 = esp_timer_get_time();
-            // H.264 decoder may output macroblock-aligned dimensions
-            int aligned_w = (width + 15) & ~15;
-            int aligned_h = (height + 15) & ~15;
-            yuv_to_framebuffer(yuv_out, fb_pixels, aligned_w, aligned_h,
-                               width, height, 800, 480);
+            if (ppa_out && ppa_stride > 0) {
+                // Use PPA-packed buffer directly from decoder (skip I420→PPA reformat)
+                ppa_to_framebuffer(ppa_out, ppa_stride, fb_pixels,
+                                   width, height, 800, 480);
+            } else {
+                // Fallback: I420 path with reformat
+                int aligned_w = (width + 15) & ~15;
+                int aligned_h = (height + 15) & ~15;
+                yuv_to_framebuffer(yuv_out, fb_pixels, aligned_w, aligned_h,
+                                   width, height, 800, 480);
+            }
             timing_decode_us += (t1 - t0);
             timing_copy_us += (esp_timer_get_time() - t1);
             timing_reformat_us += yuv_convert_get_reformat_us();

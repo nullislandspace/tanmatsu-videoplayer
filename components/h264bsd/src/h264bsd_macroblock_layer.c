@@ -80,7 +80,7 @@ static u32 DecodeResidual(strmData_t *pStrmData, residual_t *pResidual,
 static u32 DetermineNc(mbStorage_t *pMb, u32 blockIndex, i16 *pTotalCoeff);
 
 static u32 CbpIntra16x16(mbType_e mbType);
-static u32 ProcessResidual(mbStorage_t *pMb, i32 residualLevel[][16], u32 *);
+static u32 ProcessResidual(mbStorage_t *pMb, residual_t *pResidual);
 
 /*------------------------------------------------------------------------------
 
@@ -803,8 +803,7 @@ u32 h264bsdDecodeMacroblock(mbStorage_t *pMb, macroblockLayer_t *pMbLayer,
             }
             pMb->qpY = (u32)*qpY;
 
-            tmp = ProcessResidual(pMb, pMbLayer->residual.level,
-                pMbLayer->residual.coeffMap);
+            tmp = ProcessResidual(pMb, &pMbLayer->residual);
             if (tmp != HANTRO_OK)
                 return (tmp);
         }
@@ -841,29 +840,32 @@ u32 h264bsdDecodeMacroblock(mbStorage_t *pMb, macroblockLayer_t *pMbLayer,
 
 ------------------------------------------------------------------------------*/
 
-u32 ProcessResidual(mbStorage_t *pMb, i32 residualLevel[][16], u32 *coeffMap)
+u32 ProcessResidual(mbStorage_t *pMb, residual_t *pResidual)
 {
 
 /* Variables */
 
-    u32 i;
+    u32 i, j, blockIdx;
     u32 chromaQp;
     i32 (*blockData)[16];
     i32 (*blockDc)[16];
     i16 *totalCoeff;
     i32 *chromaDc;
     const u32 *dcCoeffIdx;
+    i32 (*residualLevel)[16] = pResidual->level;
+    u32 *coeffMap = pResidual->coeffMap;
 
 /* Code */
 
     ASSERT(pMb);
-    ASSERT(residualLevel);
+    ASSERT(pResidual);
 
     /* set pointers to DC coefficient blocks */
     blockDc = residualLevel + 24;
 
     blockData = residualLevel;
     totalCoeff = pMb->totalCoeff;
+    blockIdx = 0;
     if (h264bsdMbPartPredMode(pMb->mbType) == PRED_MODE_INTRA16x16)
     {
         if (totalCoeff[24])
@@ -872,7 +874,7 @@ u32 ProcessResidual(mbStorage_t *pMb, i32 residualLevel[][16], u32 *coeffMap)
         }
         dcCoeffIdx = dcCoeffIndex;
 
-        for (i = 16; i--; blockData++, totalCoeff++, coeffMap++)
+        for (i = 16; i--; blockData++, totalCoeff++, coeffMap++, blockIdx++)
         {
             /* set dc coefficient of luma block */
             (*blockData)[0] = (*blockDc)[*dcCoeffIdx++];
@@ -881,23 +883,34 @@ u32 ProcessResidual(mbStorage_t *pMb, i32 residualLevel[][16], u32 *coeffMap)
                 if (h264bsdProcessBlock(*blockData, pMb->qpY, 1, *coeffMap) !=
                     HANTRO_OK)
                     return(HANTRO_NOK);
+                /* narrow i32 → i16 (transform output guaranteed in [-512, 511]) */
+                for (j = 0; j < 16; j++)
+                    pResidual->levelI16[blockIdx][j] = (i16)(*blockData)[j];
             }
             else
+            {
                 MARK_RESIDUAL_EMPTY(*blockData);
+                MARK_RESIDUAL_EMPTY_I16(pResidual->levelI16[blockIdx]);
+            }
         }
     }
     else
     {
-        for (i = 16; i--; blockData++, totalCoeff++, coeffMap++)
+        for (i = 16; i--; blockData++, totalCoeff++, coeffMap++, blockIdx++)
         {
             if (*totalCoeff)
             {
                 if (h264bsdProcessBlock(*blockData, pMb->qpY, 0, *coeffMap) !=
                     HANTRO_OK)
                     return(HANTRO_NOK);
+                for (j = 0; j < 16; j++)
+                    pResidual->levelI16[blockIdx][j] = (i16)(*blockData)[j];
             }
             else
+            {
                 MARK_RESIDUAL_EMPTY(*blockData);
+                MARK_RESIDUAL_EMPTY_I16(pResidual->levelI16[blockIdx]);
+            }
         }
     }
 
@@ -907,7 +920,7 @@ u32 ProcessResidual(mbStorage_t *pMb, i32 residualLevel[][16], u32 *coeffMap)
     if (pMb->totalCoeff[25] || pMb->totalCoeff[26])
         h264bsdProcessChromaDc(residualLevel[25], chromaQp);
     chromaDc = residualLevel[25];
-    for (i = 8; i--; blockData++, totalCoeff++, coeffMap++)
+    for (i = 8; i--; blockData++, totalCoeff++, coeffMap++, blockIdx++)
     {
         /* set dc coefficient of chroma block */
         (*blockData)[0] = *chromaDc++;
@@ -916,9 +929,14 @@ u32 ProcessResidual(mbStorage_t *pMb, i32 residualLevel[][16], u32 *coeffMap)
             if (h264bsdProcessBlock(*blockData, chromaQp, 1,*coeffMap) !=
                 HANTRO_OK)
                 return(HANTRO_NOK);
+            for (j = 0; j < 16; j++)
+                pResidual->levelI16[blockIdx][j] = (i16)(*blockData)[j];
         }
         else
+        {
             MARK_RESIDUAL_EMPTY(*blockData);
+            MARK_RESIDUAL_EMPTY_I16(pResidual->levelI16[blockIdx]);
+        }
     }
 
     return(HANTRO_OK);

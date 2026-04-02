@@ -75,6 +75,11 @@
 /* macro to check if residual block is empty */
 #define IS_RESIDUAL_EMPTY(residual) ((residual)[0] == EMPTY_RESIDUAL_INDICATOR)
 
+/* i16 versions of residual empty macros (0x7FFF = INT16_MAX, outside [-512,511] range) */
+#define EMPTY_RESIDUAL_INDICATOR_I16 ((i16)0x7FFF)
+#define MARK_RESIDUAL_EMPTY_I16(residual) ((residual)[0] = EMPTY_RESIDUAL_INDICATOR_I16)
+#define IS_RESIDUAL_EMPTY_I16(residual) ((residual)[0] == EMPTY_RESIDUAL_INDICATOR_I16)
+
 /* macro for assertion, used only if compiler flag _ASSERT_USED is defined */
 #ifdef _ASSERT_USED
 #define ASSERT(expr) assert(expr)

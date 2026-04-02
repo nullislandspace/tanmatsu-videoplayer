@@ -55,8 +55,10 @@ typedef enum {
 
 /* structure to represent a buffered picture */
 typedef struct {
-    u8 *data;           /* 16-byte aligned pointer of pAllocatedData */
-    u8 *pAllocatedData; /* allocated picture pointer; (size + 15) bytes */
+    u8 *data;           /* 16-byte aligned I420 pointer of pAllocatedData */
+    u8 *pAllocatedData; /* allocated I420 picture pointer */
+    u8 *ppa_data;       /* 16-byte aligned PPA-packed YUV420 for display */
+    u8 *pAllocatedPpaData; /* allocated PPA buffer pointer */
     i32 picNum;
     u32 frameNum;
     i32 picOrderCnt;
@@ -70,6 +72,7 @@ typedef struct {
 /* structure to represent display image output from the buffer */
 typedef struct {
     u8 *data;
+    u8 *ppa_data;       /* PPA-packed YUV420 buffer for display */
     u32 picId;
     u32 numErrMbs;
     u32 isIdr;
@@ -93,6 +96,9 @@ typedef struct {
     u32 lastContainsMmco5;
     u32 noReordering;
     u32 flushed;
+    u32 picWidthInPixels;   /* picture width in pixels (for PPA stride calc) */
+    u32 picHeightInPixels;  /* picture height in pixels */
+    u32 ppaStride;          /* PPA-packed row stride in bytes */
 } dpbStorage_t;
 
 /*------------------------------------------------------------------------------
@@ -102,6 +108,7 @@ typedef struct {
 u32 h264bsdInitDpb(
   dpbStorage_t *dpb,
   u32 picSizeInMbs,
+  u32 picWidthInMbs,
   u32 dpbSize,
   u32 numRefFrames,
   u32 maxFrameNum,
@@ -110,6 +117,7 @@ u32 h264bsdInitDpb(
 u32 h264bsdResetDpb(
   dpbStorage_t *dpb,
   u32 picSizeInMbs,
+  u32 picWidthInMbs,
   u32 dpbSize,
   u32 numRefFrames,
   u32 maxFrameNum,
