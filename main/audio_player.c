@@ -2,6 +2,7 @@
 // Runs on Core 1 for parallel audio/video processing
 
 #include "audio_player.h"
+#include "simd_memcpy.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
@@ -35,7 +36,7 @@ extern esp_err_t bsp_audio_initialize(uint32_t rate);
 #define AUDIO_CHUNK_MAX_SIZE    4096  // Max size of a single audio chunk
 #define AUDIO_QUEUE_LENGTH      16    // Number of chunks to buffer (more headroom for high FPS)
 
-typedef struct {
+typedef struct __attribute__((aligned(16))) {
     uint8_t data[AUDIO_CHUNK_MAX_SIZE];
     size_t size;
 } audio_chunk_t;
@@ -154,7 +155,7 @@ esp_err_t audio_player_push_chunk(const uint8_t* data, size_t size) {
     }
 
     audio_chunk_t chunk;
-    memcpy(chunk.data, data, size);
+    simd_memcpy(chunk.data, data, size);
     chunk.size = size;
 
     // Try to push with very short timeout (don't block video)

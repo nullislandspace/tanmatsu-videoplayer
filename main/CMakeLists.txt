@@ -14,6 +14,7 @@ idf_component_register(
 		esp_lcd
 		badge-bsp
 		h264bsd
+		simd_utils
 		fatfs
 		sdmmc
 		esp_driver_sdmmc

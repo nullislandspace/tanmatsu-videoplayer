@@ -29,8 +29,19 @@
 #include "yuv_convert.h"
 #include "avi_parser.h"
 #include "audio_player.h"
+#include "simd_memcpy.h"
 
 static const char* TAG = "videoplayer";
+
+#ifdef CONFIG_USE_SIMD_OPTIMIZATIONS
+#warning "********************************"
+#warning "*  SIMD optimizations: ENABLED *"
+#warning "********************************"
+#else /* !CONFIG_USE_SIMD_OPTIMIZATIONS */
+#warning "*********************************"
+#warning "*  SIMD optimizations: DISABLED *"
+#warning "*********************************"
+#endif /* CONFIG_USE_SIMD_OPTIMIZATIONS */
 
 // Application states
 typedef enum {
@@ -80,7 +91,7 @@ static int next_frame_index = 0;
 static bool end_of_file = false;
 
 // Pending audio chunk
-static uint8_t pending_audio_data[4096];
+static uint8_t pending_audio_data[4096] __attribute__((aligned(16)));
 static size_t pending_audio_size = 0;
 
 // Playback timing
@@ -165,7 +176,7 @@ static int buffer_one_chunk(void) {
     if (chunk.type == AVI_CHUNK_AUDIO) {
         if (audio_player_push_chunk(chunk.data, chunk.size) == ESP_ERR_TIMEOUT) {
             if (chunk.size <= sizeof(pending_audio_data)) {
-                memcpy(pending_audio_data, chunk.data, chunk.size);
+                simd_memcpy(pending_audio_data, chunk.data, chunk.size);
                 pending_audio_size = chunk.size;
             }
         }
@@ -180,7 +191,7 @@ static int buffer_one_chunk(void) {
         }
 
         uint8_t* dest = video_buffer_slot(video_write_idx);
-        memcpy(dest, chunk.data, chunk.size);
+        simd_memcpy(dest, chunk.data, chunk.size);
         video_frames[video_write_idx].size = chunk.size;
         video_frames[video_write_idx].frame_index = next_frame_index++;
 
@@ -403,7 +414,7 @@ static esp_err_t start_playback(const char* path) {
     // Allocate video buffer
     if (!video_buffer_memory) {
         size_t buffer_size = VIDEO_BUFFER_FRAMES * VIDEO_FRAME_MAX_SIZE;
-        video_buffer_memory = heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
+        video_buffer_memory = heap_caps_aligned_alloc(16, buffer_size, MALLOC_CAP_SPIRAM);
         if (!video_buffer_memory) {
             avi_parser_close(&avi_parser);
             show_error("Out of memory for video buffer");

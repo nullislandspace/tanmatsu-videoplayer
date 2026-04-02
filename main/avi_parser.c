@@ -389,7 +389,7 @@ esp_err_t avi_parser_open(avi_parser_t* parser, const char* path) {
     parser->file_size = avi_file_size(parser->file);
 
     parser->frame_buffer_size = MAX_FRAME_SIZE;
-    parser->frame_buffer = heap_caps_malloc(parser->frame_buffer_size, MALLOC_CAP_SPIRAM);
+    parser->frame_buffer = heap_caps_aligned_alloc(16, parser->frame_buffer_size, MALLOC_CAP_SPIRAM);
     if (!parser->frame_buffer) {
         ESP_LOGE(TAG, "Failed to allocate frame buffer (%zu bytes)", parser->frame_buffer_size);
         fastclose(parser->file);
