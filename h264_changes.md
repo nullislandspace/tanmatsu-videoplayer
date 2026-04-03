@@ -193,148 +193,274 @@ inter prediction with fractional motion vectors, and scene transitions.
 
 ---
 
-## 5. SIMD Optimization Candidates
+## 5. Performance Profiling
 
-Functions below are candidates for ESP32-P4 PIE SIMD optimization via
-`#ifdef CONFIG_USE_SIMD_OPTIMIZATIONS` guards. Each entry describes the
-data layout, alignment, and recommended SIMD approach.
+### Profiling infrastructure
 
-### 5.1 h264bsdWriteOutputBlocks (h264bsd_image.c)
+`h264bsd_profile.h` provides a shared timing framework used across the decoder.
+Timers use `esp_timer_get_time()` on ESP-IDF and `clock_gettime(CLOCK_MONOTONIC)`
+on PC. Accumulated per 30-frame window and logged by `main.c`.
 
-**Priority: HIGH** — hot path for all inter-predicted macroblocks.
+Instrumented functions:
+
+| Timer | Location | Scope |
+|-------|----------|-------|
+| `INTER_PREDICTION` | h264bsd_macroblock_layer.c | per-macroblock |
+| `INTRA_PREDICTION` | h264bsd_macroblock_layer.c | per-macroblock |
+| `PROCESS_RESIDUAL` | h264bsd_macroblock_layer.c | per-macroblock |
+| `FILTER_PICTURE` | h264bsd_deblocking.c | per-frame |
+| `WRITE_OUTPUT_BLOCKS` | h264bsd_image.c | per inter-macroblock |
+| `CONVERT_PPA` | h264bsd_image.c | per-frame |
+| `LUMA_INTERP` | h264bsd_reconstruct.c | per h264bsdPredictSamples call |
+| `CHROMA_INTERP` | h264bsd_reconstruct.c | per h264bsdPredictSamples call |
+
+Luma interpolation case hit counts (cases 0-15 per `lumaFracPos` table)
+are also tracked in `h264bsd_luma_case_counts[16]`.
+
+### Measured ESP32-P4 performance (800x336 @ 15fps, Sintel)
+
+Frame budget at 15fps: **66.7ms**
+
+#### Full frame pipeline
+
+| Step | Time | Notes |
+|------|------|-------|
+| Decode (h264bsd) | ~100ms | All decoder work including PPA conversion |
+| Copy to display | ~13ms | PPA hardware SRM (scale/rotate/mirror) |
+| **Total** | **~113ms** | **1.7x over budget** |
+
+#### Decode breakdown (steady state, 30-frame average)
+
+| Component | ms/frame | % of Decode | Scope |
+|-----------|----------|-------------|-------|
+| **Inter prediction** | **43** | **43%** | per-macroblock |
+| — Luma interpolation | 20 | 20% | ~1100 calls/frame |
+| — Chroma interpolation | 7 | 7% | ~1100 calls/frame |
+| — WriteOutputBlocks | 9 | 9% | per inter-MB |
+| — MV prediction + other | 7 | 7% | |
+| **Deblocking filter** | **24** | **24%** | per-frame |
+| **PPA convert** | **11** | **11%** | per-frame |
+| Intra prediction | 4 | 4% | per intra-MB |
+| Residual (IQ + IDCT) | 3 | 3% | per-MB |
+| Other (CAVLC/NAL/DPB) | 5 | 5% | |
+
+#### Luma interpolation case distribution
+
+Cases correspond to the H.264 quarter-pixel interpolation grid (6-tap FIR
+filter combinations). `lumaFracPos[xFrac][yFrac]` maps fractional MV
+components to cases 0-15.
+
+| Cases | Function | Calls/30fr | % | Description |
+|-------|----------|-----------|---|-------------|
+| 0 | FillBlock (memcpy) | 10554 | 32% | Full-pixel, no filtering |
+| 1, 3 | InterpolateVerQuarter | 4037 | 12% | Vertical quarter-pixel |
+| 2 | InterpolateVerHalf | 2189 | 7% | Vertical half-pixel |
+| 4, 12 | InterpolateHorQuarter | 3774 | 11% | Horizontal quarter-pixel |
+| 8 | InterpolateHorHalf | 2197 | 7% | Horizontal half-pixel |
+| 5, 7, 13, 15 | InterpolateHorVerQuarter | 5721 | 17% | Diagonal quarter-pixel |
+| 10 | InterpolateMidHalf | 1505 | 5% | Center half-pixel |
+| 6, 14 | InterpolateMidHorQuarter | 1723 | 5% | Center + horizontal quarter |
+| 9, 11 | InterpolateMidVerQuarter | 1703 | 5% | Center + vertical quarter |
+
+Distribution is fairly uniform across all fractional positions. No single
+case dominates beyond case 0 (fullpel copy, already a memcpy). The 68% of
+calls requiring interpolation are spread across 9 function families.
+
+#### 400x160 performance (for comparison)
+
+At 400x160, decode averages ~25ms/frame (well within 66ms budget):
+- Inter: 10ms, Deblock: 6ms, PPA: 2ms, WrOut: 3ms, Other: 4ms
+
+---
+
+## 6. SIMD Optimization Plan
+
+Target: reduce 800x336 decode from ~100ms to ≤50ms (leaving ~13ms for PPA
+hardware and headroom for complex scenes).
+
+Functions are listed in recommended implementation order, prioritized by
+**ms saved per implementation effort**.
+
+### Tier 1: High impact, single-function targets (save ~25ms)
+
+#### 6.1 h264bsdFilterPicture — Deblocking filter (h264bsd_deblocking.c)
+
+**Measured: 24ms/frame (24% of decode). Priority: #1.**
+
+The deblocking filter runs once per frame after all macroblocks are decoded.
+It applies adaptive edge filtering at 4x4 block boundaries to reduce
+blocking artifacts. The core work is in `FilterVerLumaEdge`,
+`FilterHorLumaEdge`, `FilterVerChromaEdge`, `FilterHorChromaEdge`.
 
 ```
-Input:  data[256+128] — u8 prediction, 4-byte aligned, stride 16 (luma) / 8 (chroma)
-        lumaRows[16][16] — i16 residuals, 16-byte aligned, contiguous rows
-        chromaRows[2][8][8] — i16 residuals, 16-byte aligned, contiguous rows
-Output: image luma/cb/cr — u8, stride = picWidth (variable, may not be 16-byte aligned)
+Operation per edge: load 4 pixels on each side of boundary (p0-p3, q0-q3),
+compute boundary strength thresholds, conditionally apply 4-tap or 5-tap
+filter with clipping, write back modified pixels.
 ```
-
-**Operation per pixel:** `output = clp[prediction_u8 + residual_i16]`
 
 **SIMD approach:**
-- Load 16 u8 prediction bytes → widen to i16 via `esp.vzip.8` with zero register
-  (produces two 128-bit registers of 8 x i16 each)
-- Load 8 i16 residuals with `esp.vld.128.ip` (one register, 16-byte aligned)
-- `esp.vadd.s16` prediction + residual
-- Clamp to [0, 255] via `esp.vsat.u8` or scalar `clp[]` table
-- Narrow i16 → u8 and store to output
-- Process 8 pixels per iteration, 2 iterations per luma row, 16 rows = 32 SIMD iterations
-- Chroma: 8 pixels per row fits one register exactly, 8 rows per plane
+- Each edge processes 4 pixels vertically (luma) or 2 pixels (chroma)
+- Multiple edges per macroblock can be batched
+- Compare/clamp/delta operations map well to `esp.vadd.s16`,
+  `esp.vsub.s16`, `esp.vmin.s16`, `esp.vmax.s16`
+- Vertical edges require transpose (pixels are in adjacent rows, not
+  contiguous), limiting SIMD efficiency for vertical filtering
+- Horizontal edges are contiguous in memory, good SIMD fit
 
-**Expected speedup:** 2-3x over scalar (based on SIMD test findings — the
-original block-order version was 0.79x, but with contiguous row data the
-gather overhead is eliminated).
+**Expected speedup:** 2x (12ms saved). Vertical edge transpose overhead
+limits gains vs. pure horizontal operations.
 
-### 5.2 h264bsdConvertImageToPpa (h264bsd_image.c)
+#### 6.2 h264bsdConvertImageToPpa — I420 to PPA conversion (h264bsd_image.c)
 
-**Priority: HIGH** — runs once per frame, currently ~11ms at 800x336.
+**Measured: 11ms/frame (11% of decode). Priority: #2.**
+
+Pure byte shuffling, no arithmetic. Runs once per frame.
 
 ```
-Input:  Y plane — u8, contiguous rows, stride = picWidth, 16-byte aligned
+Input:  Y plane — u8, stride = picWidth, 16-byte aligned
         U plane — u8, stride = picWidth/2, 16-byte aligned
         V plane — u8, stride = picWidth/2, 16-byte aligned
-Output: PPA buffer — u8, stride = picWidth * 3/2, 16-byte aligned
+Output: PPA buffer — u8, stride = picWidth * 3/2, 64-byte aligned
 ```
 
 **Operation per 8 pixels:** interleave 8 Y bytes + 4 chroma bytes into 12-byte
 PPA pattern: `[C0][Y0][Y1][C2] [Y2][Y3][C4][Y4] [Y5][C6][Y6][Y7]`
 
 **SIMD approach:**
-- Load 16 Y bytes with `esp.vld.128.ip` (one register)
-- Load 8 chroma bytes with `esp.ld.128.usar.ip` (unaligned load, half register)
-- Use `esp.vzip.8` / `esp.vunzip.8` to interleave Y and chroma bytes into the
-  PPA pattern
-- The 12-byte output per 8 pixels is awkward (not power-of-2), so may need to
-  process 16 pixels (24 bytes output) per iteration for alignment
-- For 16 pixels: load 16 Y + 8 C, produce 24 output bytes, store with two
-  `esp.vst.128.ip` (16 + 8 bytes, or creative packing)
+- Process 16 pixels per iteration (24 bytes output)
+- Load 16 Y bytes with `esp.vld.128.ip`
+- Load 8 chroma bytes with `esp.ld.128.usar.ip`
+- Interleave with `esp.vzip.8` / `esp.vunzip.8` patterns
+- Store 24 output bytes (16 + 8, or creative packing)
 
-**Expected speedup:** 3-4x (bulk byte shuffling, high throughput, no arithmetic)
+**Expected speedup:** 3-4x (8ms saved). Bulk byte operations, high throughput.
 
-### 5.3 h264bsdReorderResidualToRows (h264bsd_image.c)
+#### 6.3 h264bsdWriteOutputBlocks — Residual addition (h264bsd_image.c)
 
-**Priority: LOW** — small working set per macroblock (384 i16 values).
+**Measured: 9ms/frame (9% of decode). Priority: #3.**
+
+Called for every inter-predicted macroblock (non-P_Skip). Adds i16 residuals
+to u8 predictions with clipping.
 
 ```
-Input:  levelI16[24][16] — i16, 16-byte aligned, 24 blocks x 16 coefficients
-Output: lumaRows[16][16] — i16, 16-byte aligned, 16 rows x 16 pixels
-        chromaRows[2][8][8] — i16, 16-byte aligned
+Input:  data[256+128] — u8 prediction, stride 16 (luma) / 8 (chroma)
+        lumaRows[16][16] — i16 residuals, 16-byte aligned, contiguous rows
+        chromaRows[2][8][8] — i16 residuals, 16-byte aligned, contiguous rows
+Output: image luma/cb/cr — u8, stride = picWidth
 ```
 
-**Operation:** scatter 4x4 block (32 bytes) to 4 rows of 4 i16 values each.
+**Operation per pixel:** `output = clip(prediction_u8 + residual_i16, 0, 255)`
 
 **SIMD approach:**
-- Load 32-byte block with two `esp.vld.128.ip` (rows 0-1 in q0, rows 2-3 in q1)
-- Store with offset to correct row position
-- Limited by scatter pattern — each 4-element row-segment is only 8 bytes
-  (half a register), so stores are sub-register width
-- PIE has no gather/scatter instructions; must use scalar addressing for
-  non-contiguous destinations
+- Load 8 u8 predictions → widen to i16 via `esp.vzip.8` with zero register
+- Load 8 i16 residuals with `esp.vld.128.ip` (16-byte aligned)
+- `esp.vadd.s16` prediction + residual
+- Saturate and narrow i16 → u8
+- 2 iterations per luma row (16 pixels), 16 rows + 2×8 chroma rows
 
-**Expected speedup:** Marginal (~1.2x). The scalar version is already fast
-for 384 values. Not worth optimizing unless profiling shows it's a bottleneck.
+**Expected speedup:** 2-3x (5ms saved). Data is already row-contiguous and
+aligned for SIMD access.
 
-### 5.4 h264bsdAddResidual (h264bsd_intra_prediction.c)
+### Tier 2: Medium impact, multiple functions (save ~15ms)
 
-**Priority: LOW** — called per 4x4 block during intra prediction.
+#### 6.4 Luma interpolation functions (h264bsd_reconstruct.c)
 
-```
-Input:  data — u8 prediction buffer, stride 16 (luma) or 8 (chroma)
-        residual[16] — i16, block-order (4 rows x 4 cols sequential)
-Output: data — u8, prediction + residual clipped to [0,255]
-```
+**Measured: 20ms/frame total (20% of decode). Spread across 9 function
+families, ~1100 calls/frame.**
 
-**Operation per pixel:** `data[i] = clp[data[i] + residual[i]]`
-
-**SIMD approach:**
-- 4 pixels per row, 4 rows = 16 pixels total
-- 4 pixels = 4 u8 = only 32 bits of a 128-bit register — very poor utilization
-- Would need to batch 4 blocks (4 rows of 16 pixels) to fill registers, but
-  blocks are processed independently with different prediction modes
-- Scalar `clp[]` table lookup is very efficient for 16 values
-
-**Expected speedup:** Negligible. The 4-pixel width doesn't fill SIMD registers.
-Keep scalar unless the calling pattern can be restructured to batch blocks.
-
-### 5.5 h264bsdInterpolateVerHalf (h264bsd_reconstruct.c)
-
-**Priority: MEDIUM** — already has a SIMD implementation (1.50x speedup).
+Each function implements a variant of the H.264 6-tap FIR filter for
+sub-pixel motion compensation. All share a common pattern:
 
 ```
-Input:  ref — u8 reference frame, stride = width (unaligned)
+Input:  ref — u8 reference frame, stride = picWidth (unaligned)
 Output: mb — u8 prediction block, stride 16
 ```
 
-**Status:** SIMD version already implemented behind `CONFIG_USE_SIMD_OPTIMIZATIONS`.
-Uses `esp.ld.128.usar.ip` for unaligned loads, `esp.vzip.8` for u8→i16 widening,
-`esp.vadd.s16`/`esp.vsub.s16` for 6-tap FIR filter, scalar `clp[]` for narrowing.
+**Functions by call frequency (high to low):**
 
-**Note:** Testing on device showed no measurable improvement for the test videos
-because this specific interpolation mode (vertical half-pixel, case 2 of 16)
-wasn't called frequently enough. The implementation is correct and will help
-for content with more vertical motion.
+1. `h264bsdFillBlock` (case 0, 32%) — memcpy, already fast
+2. `h264bsdInterpolateHorVerQuarter` (cases 5,7,13,15, 17%) — 6-tap H + 6-tap V + average
+3. `h264bsdInterpolateVerQuarter` (cases 1,3, 12%) — 6-tap V + average
+4. `h264bsdInterpolateHorQuarter` (cases 4,12, 11%) — 6-tap H + average
+5. `h264bsdInterpolateVerHalf` (case 2, 7%) — 6-tap V [SIMD already implemented]
+6. `h264bsdInterpolateHorHalf` (case 8, 7%) — 6-tap H
+7. `h264bsdInterpolateMidHalf` (case 10, 5%) — 6-tap H + 6-tap V
+8. `h264bsdInterpolateMidHorQuarter` (cases 6,14, 5%) — 6-tap H + 6-tap V + avg H
+9. `h264bsdInterpolateMidVerQuarter` (cases 9,11, 5%) — 6-tap H + 6-tap V + avg V
 
-### 5.6 SIMD memcpy (components/simd_utils/)
+**SIMD approach (shared across all):**
+- Unaligned reference loads with `esp.ld.128.usar.ip`
+- u8→i16 widening with `esp.vzip.8` and zero register
+- 6-tap FIR: `(a - 5b + 20c + 20d - 5e + f + 16) >> 5` using
+  `esp.vadd.s16`, `esp.vsub.s16`, `esp.vmul.s16` (or shift+add)
+- Clamp to [0, 255] and narrow i16→u8
 
-**Priority: MEDIUM** — utility function, already implemented.
+**Implementation strategy:** Start with `h264bsdInterpolateHorHalf` (case 8,
+pure horizontal 6-tap, simplest SIMD pattern), then extend to
+`h264bsdInterpolateHorQuarter` (adds averaging step). The vertical variants
+require column-wise access patterns that are less SIMD-friendly.
 
-```
-Input:  src — 16-byte aligned, arbitrary size
-Output: dst — 16-byte aligned
-```
+**Note:** `h264bsdInterpolateVerHalf` (case 2) already has a SIMD
+implementation behind `CONFIG_USE_SIMD_OPTIMIZATIONS`, achieving 1.50x
+speedup in isolated testing.
 
-**Status:** Implemented in `components/simd_utils/include/simd_memcpy.h`.
-Uses 8-register unrolled PIE loads/stores (128 bytes per iteration).
-4.3-4.5x speedup over libc memcpy. Falls back to standard memcpy when
-`CONFIG_USE_SIMD_OPTIMIZATIONS` is not set.
+**Expected speedup:** 1.5-2x across all functions (10ms saved). Limited by
+unaligned reference loads and variable block sizes (4x4 through 16x16).
 
-Currently used for video frame buffer copies in `main.c` and audio chunk
-copies in `audio_player.c`.
+#### 6.5 Chroma interpolation (h264bsd_reconstruct.c)
+
+**Measured: 7ms/frame (7% of decode). ~1100 calls/frame.**
+
+Bilinear interpolation on 8×8 or smaller chroma blocks. Three functions:
+`h264bsdInterpolateChromaHor`, `h264bsdInterpolateChromaVer`,
+`h264bsdInterpolateChromaHorVer`.
+
+**Expected speedup:** 1.5-2x (3-4ms saved). Small block sizes limit SIMD
+utilization.
+
+### Tier 3: Low impact (not recommended)
+
+#### 6.6 h264bsdReorderResidualToRows (h264bsd_image.c)
+
+Not measured separately. Small working set (384 i16 values per macroblock).
+Scatter pattern doesn't map well to SIMD. Keep scalar.
+
+#### 6.7 h264bsdAddResidual (h264bsd_intra_prediction.c)
+
+Part of intra prediction (4ms/frame total). Operates on 4x4 blocks (4 u8
+per row = 32 bits, poor register utilization). Keep scalar.
+
+#### 6.8 ProcessResidual / IDCT (h264bsd_macroblock_layer.c)
+
+3ms/frame. Inverse quantization + 4x4 IDCT. Small working set per block.
+The i32→i16 narrowing added by the rewrite is part of this. Keep scalar.
+
+### Existing SIMD implementations
+
+| Function | Location | Speedup | Notes |
+|----------|----------|---------|-------|
+| `h264bsdInterpolateVerHalf` | h264bsd_reconstruct.c | 1.50x | Case 2 only, ~7% of luma calls |
+| `simd_memcpy` | simd_utils/simd_memcpy.h | 4.3-4.5x | 8-register unrolled, 128 bytes/iter |
+
+### Projected impact summary
+
+| Optimization | Current | Target | Saved |
+|-------------|---------|--------|-------|
+| Deblocking (2x) | 24ms | 12ms | 12ms |
+| PPA convert (3x) | 11ms | 3ms | 8ms |
+| WriteOutputBlocks (2.5x) | 9ms | 4ms | 5ms |
+| Luma interpolation (1.5x) | 20ms | 13ms | 7ms |
+| Chroma interpolation (1.5x) | 7ms | 4ms | 3ms |
+| **Total saved** | | | **35ms** |
+| **Projected decode** | **100ms** | **~65ms** | |
+
+This would bring 800x336 decode to ~65ms, just under the 66ms frame budget.
+Tier 1 alone (deblocking + PPA + WriteOutputBlocks) saves ~25ms for ~75ms
+decode, which would eliminate most frame skipping.
 
 ---
 
-## 6. Performance Notes
+## 7. Performance Notes
 
 ### PC benchmark (x86, gcc -O2, Sintel 13322 frames)
 
@@ -345,18 +471,15 @@ copies in `audio_player.c`.
 
 The overhead comes from i32→i16 narrowing, block→row reorder, and full-frame
 PPA conversion. On ESP32-P4, the PPA conversion replaces the existing
-`i420_to_ppa_yuv420` (11.3ms), so the net effect should be a reduction in
-total frame time.
+`i420_to_ppa_yuv420` (11.3ms), so the net effect is a reduction in total
+frame time.
 
-### Expected ESP32-P4 impact
+### Measured ESP32-P4 frame timing
 
-| Step | Before | After |
-|------|--------|-------|
-| Decode | ~70ms | ~70ms + small narrowing/reorder overhead |
-| Reformat (I420→PPA) | 11.3ms | 0ms (integrated into decode) |
-| PPA hardware | 12.6ms | 12.6ms (unchanged) |
-| **Total** | ~94ms | ~83ms (estimated) |
-
-The real payoff comes when SIMD optimizations (section 5) are added for
-`h264bsdWriteOutputBlocks` and `h264bsdConvertImageToPpa`, which are now
-structured for efficient SIMD access with contiguous, aligned data.
+| Step | 400x160 | 800x336 |
+|------|---------|---------|
+| Decode | ~25ms | ~100ms |
+| PPA hardware | ~5ms | ~13ms |
+| **Total** | **~30ms** | **~113ms** |
+| **Max FPS** | **~34fps** | **~9fps** |
+| 15fps budget | OK (30 < 66ms) | Over (113 > 66ms) |

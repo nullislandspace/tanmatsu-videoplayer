@@ -26,6 +26,7 @@
 #include "file_browser.h"
 #include "mjpeg_decoder.h"
 #include "video_decoder.h"
+#include "h264bsd_profile.h"
 #include "yuv_convert.h"
 #include "avi_parser.h"
 #include "audio_player.h"
@@ -382,10 +383,36 @@ static bool process_video_frame(uint8_t* fb_pixels, int fb_stride, int fb_height
         timing_frame_count++;
 
         if (timing_frame_count >= 30) {
+            float d = 30000.0f;
+            u32 wob = h264bsdGetTimer(H264_TIMER_WRITE_OUTPUT_BLOCKS);
+            u32 ppa_c = h264bsdGetTimer(H264_TIMER_CONVERT_PPA);
+            u32 filt = h264bsdGetTimer(H264_TIMER_FILTER_PICTURE);
+            u32 inter = h264bsdGetTimer(H264_TIMER_INTER_PREDICTION);
+            u32 intra = h264bsdGetTimer(H264_TIMER_INTRA_PREDICTION);
+            u32 resid = h264bsdGetTimer(H264_TIMER_PROCESS_RESIDUAL);
+            u32 accounted = wob + ppa_c + filt + inter + intra + resid;
             ESP_LOGI(TAG, "Avg(30): Decode=%.1fms Copy=%.1fms (Reformat=%.1fms PPA=%.1fms) | Buf=%d",
-                     timing_decode_us / 30000.0f, timing_copy_us / 30000.0f,
-                     timing_reformat_us / 30000.0f, timing_ppa_us / 30000.0f,
+                     timing_decode_us / d, timing_copy_us / d,
+                     timing_reformat_us / d, timing_ppa_us / d,
                      video_buffered);
+            u32 luma = h264bsdGetTimer(H264_TIMER_LUMA_INTERP);
+            u32 chroma = h264bsdGetTimer(H264_TIMER_CHROMA_INTERP);
+            ESP_LOGI(TAG, "  h264(30): Inter=%.1f(L=%.1f C=%.1f) Intra=%.1f Resid=%.1f Deblock=%.1f WrOut=%.1f PpaCvt=%.1f Other=%.1fms",
+                     inter / d, luma / d, chroma / d,
+                     intra / d, resid / d, filt / d,
+                     wob / d, ppa_c / d,
+                     (timing_decode_us - accounted) / d);
+            /* Log luma interpolation case distribution */
+            ESP_LOGI(TAG, "  luma cases: 0:%u 1:%u 2:%u 3:%u 4:%u 5:%u 6:%u 7:%u 8:%u 9:%u 10:%u 11:%u 12:%u 13:%u 14:%u 15:%u",
+                     h264bsd_luma_case_counts[0], h264bsd_luma_case_counts[1],
+                     h264bsd_luma_case_counts[2], h264bsd_luma_case_counts[3],
+                     h264bsd_luma_case_counts[4], h264bsd_luma_case_counts[5],
+                     h264bsd_luma_case_counts[6], h264bsd_luma_case_counts[7],
+                     h264bsd_luma_case_counts[8], h264bsd_luma_case_counts[9],
+                     h264bsd_luma_case_counts[10], h264bsd_luma_case_counts[11],
+                     h264bsd_luma_case_counts[12], h264bsd_luma_case_counts[13],
+                     h264bsd_luma_case_counts[14], h264bsd_luma_case_counts[15]);
+            h264bsdResetTimers();
             timing_decode_us = 0;
             timing_copy_us = 0;
             timing_reformat_us = 0;

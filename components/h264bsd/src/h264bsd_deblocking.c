@@ -53,6 +53,7 @@
 #include "h264bsd_macroblock_layer.h"
 #include "h264bsd_deblocking.h"
 #include "h264bsd_dpb.h"
+#include "h264bsd_profile.h"
 
 
 /*------------------------------------------------------------------------------
@@ -388,6 +389,7 @@ void h264bsdFilterPicture(
     mbStorage_t *pMb;
     bS_t bS[16];
     edgeThreshold_t thresholds[3];
+    u32 t_start = H264_GET_TIME_US();
 
 /* Code */
 
@@ -439,6 +441,7 @@ void h264bsdFilterPicture(
         }
     }
 
+    h264bsdTimerAdd(H264_TIMER_FILTER_PICTURE, H264_GET_TIME_US() - t_start);
 }
 
 int sample = 0;

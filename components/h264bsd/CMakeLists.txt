@@ -28,4 +28,6 @@ idf_component_register(
         "src/h264bsd_vui.c"
     INCLUDE_DIRS
         "src"
+    PRIV_REQUIRES
+        esp_timer
 )

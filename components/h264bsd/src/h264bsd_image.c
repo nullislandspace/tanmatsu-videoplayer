@@ -39,6 +39,25 @@
 #include "h264bsd_macroblock_layer.h"
 #include <string.h>
 
+#include "h264bsd_profile.h"
+
+/* Timer array definition — single instance, declared extern in h264bsd_profile.h */
+u32 h264bsd_timers[H264_TIMER_COUNT];
+u32 h264bsd_luma_case_counts[16];
+
+void h264bsdResetTimers(void) {
+    for (int i = 0; i < H264_TIMER_COUNT; i++)
+        h264bsd_timers[i] = 0;
+    for (int i = 0; i < 16; i++)
+        h264bsd_luma_case_counts[i] = 0;
+}
+
+u32 h264bsdGetTimer(int id) {
+    if (id >= 0 && id < H264_TIMER_COUNT)
+        return h264bsd_timers[id];
+    return 0;
+}
+
 /*------------------------------------------------------------------------------
     2. External compiler flags
 --------------------------------------------------------------------------------
@@ -261,6 +280,7 @@ void h264bsdWriteOutputBlocks(image_t *image, u32 mbNum, u8 *data,
     u8 *lum, *cb, *cr;
     u32 row, col, comp;
     const u8 *clp = h264bsdClip + 512;
+    u32 t_start = H264_GET_TIME_US();
 
 /* Code */
 
@@ -311,6 +331,7 @@ void h264bsdWriteOutputBlocks(image_t *image, u32 mbNum, u8 *data,
         }
     }
 
+    h264bsdTimerAdd(H264_TIMER_WRITE_OUTPUT_BLOCKS, H264_GET_TIME_US() - t_start);
 }
 
 /*------------------------------------------------------------------------------
@@ -345,6 +366,8 @@ void h264bsdConvertImageToPpa(image_t *image)
 
     if (!image->ppa_data)
         return;
+
+    u32 t_start = H264_GET_TIME_US();
 
     picWidth = image->width;
     picHeight = image->height;
@@ -386,5 +409,7 @@ void h264bsdConvertImageToPpa(image_t *image)
             dst += 12;
         }
     }
+
+    h264bsdTimerAdd(H264_TIMER_CONVERT_PPA, H264_GET_TIME_US() - t_start);
 }
 

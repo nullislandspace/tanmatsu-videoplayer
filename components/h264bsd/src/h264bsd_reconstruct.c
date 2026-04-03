@@ -37,9 +37,8 @@
 #include "h264bsd_image.h"
 #include "h264bsd_util.h"
 
-#ifdef CONFIG_USE_SIMD_OPTIMIZATIONS
-#include <stdint.h>
-#endif
+#include "h264bsd_profile.h"
+
 
 
 /*------------------------------------------------------------------------------
@@ -480,162 +479,6 @@ static void PredictChroma(
 
 ------------------------------------------------------------------------------*/
 
-#ifdef CONFIG_USE_SIMD_OPTIMIZATIONS
-/*
- * SIMD-optimized vertical half-pixel interpolation using ESP32-P4 PIE.
- *
- * 6-tap FIR filter: out = clip((A - 5*B + 20*C + 20*D - 5*E + F + 16) >> 5)
- *
- * Strategy:
- *   1. Widen all input rows u8→i16 using SIMD (vzip.8 with zero register)
- *   2. Filter in i16 using vadd/vsub chains (5x = 4x+x, 20x = 16x+4x)
- *   3. Narrow via scalar clp[val >> 5] clipping table (faster than SIMD clamp)
- *
- * ~1.50x speedup over C reference on ESP32-P4 (35-40% of decode time).
- */
-void h264bsdInterpolateVerHalf(
-  u8 *ref,
-  u8 *mb,
-  i32 x0,
-  i32 y0,
-  u32 width,
-  u32 height,
-  u32 partWidth,
-  u32 partHeight)
-{
-    u32 p1[21*21/4+1];
-    const u8 *clp = h264bsdClip + 512;
-
-    ASSERT(ref);
-    ASSERT(mb);
-
-    if ((x0 < 0) || ((u32)x0+partWidth > width) ||
-        (y0 < 0) || ((u32)y0+partHeight+5 > height))
-    {
-        h264bsdFillBlock(ref, (u8*)p1, x0, y0, width, height,
-                partWidth, partHeight+5, partWidth);
-        x0 = 0;
-        y0 = 0;
-        ref = (u8*)p1;
-        width = partWidth;
-    }
-
-    ref += (u32)y0 * width + (u32)x0;
-
-    u32 numInputRows = partHeight + 5;
-    /* Buffer stride: 16 i16 elements per row = 32 bytes (always 16-byte aligned) */
-    const u32 bufStride = 16;
-
-    /* Step 1: Widen all input rows from u8 to i16 using SIMD */
-    int16_t work[21 * 16] __attribute__((aligned(16)));
-
-    for (u32 r = 0; r < numInputRows; r++) {
-        const u8 *src = ref + r * width;
-        int16_t *dst = &work[r * bufStride];
-
-        if (partWidth >= 8) {
-            register u8 *p_lo asm("a0") = (u8 *)src;
-            register u8 *p_hi asm("a1") = (u8 *)src + 16;
-            register int16_t *pdst_lo asm("a2") = dst;
-            register int16_t *pdst_hi asm("a3") = dst + 8;
-
-            asm volatile(
-                "esp.ld.128.usar.ip q0, %[p_lo], 16\n"
-                "esp.ld.128.usar.ip q1, %[p_hi], 0\n"
-                "esp.src.q q2, q0, q1\n"
-                "esp.zero.q q3\n"
-                "esp.vzip.8 q2, q3\n"
-                "esp.vst.128.ip q2, %[pdst_lo], 0\n"
-                "esp.vst.128.ip q3, %[pdst_hi], 0\n"
-                : [p_lo] "+r"(p_lo), [p_hi] "+r"(p_hi),
-                  [pdst_lo] "+r"(pdst_lo), [pdst_hi] "+r"(pdst_hi)
-                :: "memory"
-            );
-        } else {
-            for (u32 c = 0; c < partWidth; c++)
-                dst[c] = (int16_t)src[c];
-            for (u32 c = partWidth; c < bufStride; c++)
-                dst[c] = 0;
-        }
-    }
-
-    /* Step 2: Filter in i16 + bias + scalar narrowing */
-    int16_t bias_buf[8] __attribute__((aligned(16))) = {16,16,16,16,16,16,16,16};
-    int16_t tmp8[8] __attribute__((aligned(16)));
-
-    for (u32 r = 0; r < partHeight; r++) {
-        int16_t *rA = &work[(r + 0) * bufStride];
-        int16_t *rB = &work[(r + 1) * bufStride];
-        int16_t *rC = &work[(r + 2) * bufStride];
-        int16_t *rD = &work[(r + 3) * bufStride];
-        int16_t *rE = &work[(r + 4) * bufStride];
-        int16_t *rF = &work[(r + 5) * bufStride];
-        u8 *mbRow = mb + r * 16;
-
-        for (u32 col = 0; col < partWidth; col += 8) {
-            register int16_t *pA asm("a0") = rA + col;
-            register int16_t *pB asm("a1") = rB + col;
-            register int16_t *pC asm("a2") = rC + col;
-            register int16_t *pD asm("a3") = rD + col;
-            register int16_t *pE asm("a4") = rE + col;
-            register int16_t *pF asm("a5") = rF + col;
-
-            asm volatile(
-                /* Load 6 rows into q0-q5 */
-                "esp.vld.128.ip q0, %[pA], 0\n"
-                "esp.vld.128.ip q1, %[pB], 0\n"
-                "esp.vld.128.ip q2, %[pC], 0\n"
-                "esp.vld.128.ip q3, %[pD], 0\n"
-                "esp.vld.128.ip q4, %[pE], 0\n"
-                "esp.vld.128.ip q5, %[pF], 0\n"
-
-                /* Filter: (A+F) - 5*(B+E) + 20*(C+D) */
-                "esp.vadd.s16 q6, q0, q5\n"    /* q6 = A + F */
-                "esp.vadd.s16 q7, q1, q4\n"    /* q7 = t2 = B + E */
-                "esp.vadd.s16 q0, q2, q3\n"    /* q0 = t3 = C + D */
-                "esp.vadd.s16 q1, q7, q7\n"    /* 2*t2 */
-                "esp.vadd.s16 q1, q1, q1\n"    /* 4*t2 */
-                "esp.vadd.s16 q1, q1, q7\n"    /* 5*t2 */
-                "esp.vadd.s16 q2, q0, q0\n"    /* 2*t3 */
-                "esp.vadd.s16 q3, q2, q2\n"    /* 4*t3 */
-                "esp.vadd.s16 q4, q3, q3\n"    /* 8*t3 */
-                "esp.vadd.s16 q5, q4, q4\n"    /* 16*t3 */
-                "esp.vadd.s16 q2, q5, q3\n"    /* 20*t3 */
-                "esp.vsub.s16 q3, q6, q1\n"    /* t1 - 5*t2 */
-                "esp.vadd.s16 q3, q3, q2\n"    /* + 20*t3 -> q3 = result */
-
-                : [pA] "+r"(pA), [pB] "+r"(pB), [pC] "+r"(pC),
-                  [pD] "+r"(pD), [pE] "+r"(pE), [pF] "+r"(pF)
-                :: "memory"
-            );
-
-            /* Add bias +16 and store to temp */
-            pA = (int16_t *)bias_buf;
-            pB = (int16_t *)tmp8;
-            asm volatile(
-                "esp.vld.128.ip q4, %[pA], 0\n"
-                "esp.vadd.s16 q3, q3, q4\n"
-                "esp.vst.128.ip q3, %[pB], 0\n"
-                : [pA] "+r"(pA), [pB] "+r"(pB)
-                :: "memory"
-            );
-
-            /* Scalar >>5 + clamp via clipping table + store u8 */
-            u8 *out = mbRow + col;
-            out[0] = clp[tmp8[0] >> 5];
-            out[1] = clp[tmp8[1] >> 5];
-            out[2] = clp[tmp8[2] >> 5];
-            out[3] = clp[tmp8[3] >> 5];
-            out[4] = clp[tmp8[4] >> 5];
-            out[5] = clp[tmp8[5] >> 5];
-            out[6] = clp[tmp8[6] >> 5];
-            out[7] = clp[tmp8[7] >> 5];
-        }
-    }
-}
-
-#else /* !CONFIG_USE_SIMD_OPTIMIZATIONS — C reference */
-
 void h264bsdInterpolateVerHalf(
   u8 *ref,
   u8 *mb,
@@ -741,8 +584,6 @@ void h264bsdInterpolateVerHalf(
     }
 
 }
-
-#endif /* CONFIG_USE_SIMD_OPTIMIZATIONS */
 
 /*------------------------------------------------------------------------------
 
@@ -2009,7 +1850,11 @@ void h264bsdPredictSamples(
 
     ASSERT(lumaFracPos[xFrac][yFrac] < 16);
 
-    switch (lumaFracPos[xFrac][yFrac])
+    {
+    u32 t_luma = H264_GET_TIME_US();
+    u32 lumaCase = lumaFracPos[xFrac][yFrac];
+    h264bsd_luma_case_counts[lumaCase]++;
+    switch (lumaCase)
     {
         case 0: /* G */
             h264bsdFillBlock(refPic->data, lumaPartData,
@@ -2076,8 +1921,12 @@ void h264bsdPredictSamples(
                     xInt-2, yInt-2, width, height, partWidth, partHeight, 3);
             break;
     }
+    h264bsdTimerAdd(H264_TIMER_LUMA_INTERP, H264_GET_TIME_US() - t_luma);
+    }
 
     /* chroma */
+    {
+    u32 t_chroma = H264_GET_TIME_US();
     PredictChroma(
       data + 16*16 + (partY>>1)*8 + (partX>>1),
       xA + partX,
@@ -2086,6 +1935,8 @@ void h264bsdPredictSamples(
       partHeight,
       mv,
       refPic);
+    h264bsdTimerAdd(H264_TIMER_CHROMA_INTERP, H264_GET_TIME_US() - t_chroma);
+    }
 
 }
 

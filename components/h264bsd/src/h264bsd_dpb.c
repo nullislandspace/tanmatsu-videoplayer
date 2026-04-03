@@ -1031,13 +1031,14 @@ u32 h264bsdInitDpb(
 
         dpb->buffer[i].data = ALIGN(dpb->buffer[i].pAllocatedData, 16);
 
-        /* PPA-packed YUV420 buffer: 1.5 bytes per pixel, same total as I420 */
+        /* PPA-packed YUV420 buffer: 1.5 bytes per pixel, same total as I420.
+         * Must be 64-byte aligned for ESP32-P4 cache sync (esp_cache_msync). */
         {
             u32 ppaSize = picSizeInMbs * 384; /* same byte count as I420 */
-            ALLOCATE(dpb->buffer[i].pAllocatedPpaData, ppaSize + 15, u8);
+            ALLOCATE(dpb->buffer[i].pAllocatedPpaData, ppaSize + 63, u8);
             if (dpb->buffer[i].pAllocatedPpaData == NULL)
                 return(MEMORY_ALLOCATION_ERROR);
-            dpb->buffer[i].ppa_data = ALIGN(dpb->buffer[i].pAllocatedPpaData, 16);
+            dpb->buffer[i].ppa_data = ALIGN(dpb->buffer[i].pAllocatedPpaData, 64);
         }
     }
 

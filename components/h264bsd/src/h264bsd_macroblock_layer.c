@@ -54,6 +54,7 @@
 #include "h264bsd_transform.h"
 #include "h264bsd_intra_prediction.h"
 #include "h264bsd_inter_prediction.h"
+#include "h264bsd_profile.h"
 
 /*------------------------------------------------------------------------------
     2. External compiler flags
@@ -803,7 +804,11 @@ u32 h264bsdDecodeMacroblock(mbStorage_t *pMb, macroblockLayer_t *pMbLayer,
             }
             pMb->qpY = (u32)*qpY;
 
-            tmp = ProcessResidual(pMb, &pMbLayer->residual);
+            {
+                u32 t0 = H264_GET_TIME_US();
+                tmp = ProcessResidual(pMb, &pMbLayer->residual);
+                h264bsdTimerAdd(H264_TIMER_PROCESS_RESIDUAL, H264_GET_TIME_US() - t0);
+            }
             if (tmp != HANTRO_OK)
                 return (tmp);
         }
@@ -814,14 +819,18 @@ u32 h264bsdDecodeMacroblock(mbStorage_t *pMb, macroblockLayer_t *pMbLayer,
         }
         if (h264bsdMbPartPredMode(mbType) != PRED_MODE_INTER)
         {
+            u32 t0 = H264_GET_TIME_US();
             tmp = h264bsdIntraPrediction(pMb, pMbLayer, currImage, mbNum,
                 constrainedIntraPredFlag, (u8*)data);
+            h264bsdTimerAdd(H264_TIMER_INTRA_PREDICTION, H264_GET_TIME_US() - t0);
             if (tmp != HANTRO_OK) return (tmp);
         }
         else
         {
+            u32 t0 = H264_GET_TIME_US();
             tmp = h264bsdInterPrediction(pMb, pMbLayer, dpb, mbNum,
                 currImage, (u8*)data);
+            h264bsdTimerAdd(H264_TIMER_INTER_PREDICTION, H264_GET_TIME_US() - t0);
             if (tmp != HANTRO_OK) return (tmp);
         }
     }
