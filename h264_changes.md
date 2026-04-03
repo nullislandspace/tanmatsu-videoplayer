@@ -400,9 +400,9 @@ pure horizontal 6-tap, simplest SIMD pattern), then extend to
 `h264bsdInterpolateHorQuarter` (adds averaging step). The vertical variants
 require column-wise access patterns that are less SIMD-friendly.
 
-**Note:** `h264bsdInterpolateVerHalf` (case 2) already has a SIMD
-implementation behind `CONFIG_USE_SIMD_OPTIMIZATIONS`, achieving 1.50x
-speedup in isolated testing.
+**Note:** `h264bsdInterpolateVerHalf` (case 2) had a previous SIMD
+implementation that was removed after the h264 internals rewrite. It will
+need to be re-implemented against the new code structure.
 
 **Expected speedup:** 1.5-2x across all functions (10ms saved). Limited by
 unaligned reference loads and variable block sizes (4x4 through 16x16).
@@ -439,8 +439,11 @@ The i32→i16 narrowing added by the rewrite is part of this. Keep scalar.
 
 | Function | Location | Speedup | Notes |
 |----------|----------|---------|-------|
-| `h264bsdInterpolateVerHalf` | h264bsd_reconstruct.c | 1.50x | Case 2 only, ~7% of luma calls |
 | `simd_memcpy` | simd_utils/simd_memcpy.h | 4.3-4.5x | 8-register unrolled, 128 bytes/iter |
+
+Note: The previous SIMD version of `h264bsdInterpolateVerHalf` was removed
+after the h264 internals rewrite. It will be re-implemented against the new
+code structure.
 
 ### Projected impact summary
 
