@@ -26,6 +26,8 @@ idf_component_register(
         "src/h264bsd_util.c"
         "src/h264bsd_vlc.c"
         "src/h264bsd_vui.c"
+        "src/simd/p4/write_output_blocks_simd_p4.c"
+        "src/simd/p4/filter_hor_luma_simd_p4.c"
     INCLUDE_DIRS
         "src"
     PRIV_REQUIRES

@@ -48,6 +48,7 @@
     1. Include headers
 ------------------------------------------------------------------------------*/
 
+#include "sdkconfig.h"
 #include "basetype.h"
 #include "h264bsd_util.h"
 #include "h264bsd_macroblock_layer.h"
@@ -146,7 +147,10 @@ static void FilterVerLumaEdge( u8 *data, u32 bS, edgeThreshold_t *thresholds,
         u32 imageWidth);
 static void FilterHorLumaEdge( u8 *data, u32 bS, edgeThreshold_t *thresholds,
         i32 imageWidth);
-static void FilterHorLuma( u8 *data, u32 bS, edgeThreshold_t *thresholds,
+/* FilterHorLuma: non-static so that a SIMD-optimized version in a separate
+ * translation unit (under simd/p4/) can provide the definition when
+ * CONFIG_USE_SIMD_OPTIMIZATIONS is enabled. */
+void FilterHorLuma( u8 *data, u32 bS, edgeThreshold_t *thresholds,
         i32 imageWidth);
 
 static void FilterVerChromaEdge( u8 *data, u32 bS, edgeThreshold_t *thresholds,
@@ -649,6 +653,7 @@ void FilterHorLumaEdge(
             be done when bS is equal to all four edges.
 
 ------------------------------------------------------------------------------*/
+#ifndef CONFIG_USE_SIMD_OPTIMIZATIONS
 void FilterHorLuma(
   u8 *data,
   u32 bS,
@@ -760,6 +765,7 @@ void FilterHorLuma(
     // hashA += data[-imageWidth*2] + data[-imageWidth] + data[0] + data[imageWidth];
 
 }
+#endif /* !CONFIG_USE_SIMD_OPTIMIZATIONS */
 
 /*------------------------------------------------------------------------------
 

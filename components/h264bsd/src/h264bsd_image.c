@@ -33,6 +33,7 @@
     1. Include headers
 ------------------------------------------------------------------------------*/
 
+#include "sdkconfig.h"
 #include "h264bsd_image.h"
 #include "h264bsd_util.h"
 #include "h264bsd_neighbour.h"
@@ -270,6 +271,8 @@ void h264bsdReorderResidualToRows(residual_t *pResidual)
 
 ------------------------------------------------------------------------------*/
 
+#ifndef CONFIG_USE_SIMD_OPTIMIZATIONS
+
 void h264bsdWriteOutputBlocks(image_t *image, u32 mbNum, u8 *data,
         residual_t *pResidual)
 {
@@ -333,6 +336,8 @@ void h264bsdWriteOutputBlocks(image_t *image, u32 mbNum, u8 *data,
 
     h264bsdTimerAdd(H264_TIMER_WRITE_OUTPUT_BLOCKS, H264_GET_TIME_US() - t_start);
 }
+
+#endif /* !CONFIG_USE_SIMD_OPTIMIZATIONS */
 
 /*------------------------------------------------------------------------------
 
