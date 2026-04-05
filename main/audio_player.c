@@ -11,6 +11,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "bsp/audio.h"
+#include "bsp/input.h"
 #include "driver/i2s_std.h"
 #include "esp_mp3_dec.h"
 #include <string.h>
@@ -59,6 +60,19 @@ static volatile uint32_t actual_sample_rate = AUDIO_SAMPLE_RATE;
 // PCM buffer in internal SRAM for DMA
 static DRAM_ATTR int16_t pcm_buffer[PCM_BUFFER_SAMPLES * 2] __attribute__((aligned(16)));
 
+// Headphone state tracking. On newer coprocessor firmware the amp is
+// automatically disabled when headphones are plugged in; on older firmware
+// we must do this manually. Tracking the state here and gating the
+// amplifier through amp_set() keeps the behavior correct on both.
+static bool headphones_connected = false;
+static bool amp_wanted_on = false;
+
+static void amp_set(bool want_on) {
+    amp_wanted_on = want_on;
+    // Only drive the built-in speaker amp when no headphones are plugged in.
+    bsp_audio_set_amplifier(want_on && !headphones_connected);
+}
+
 // Forward declarations
 static void audio_task(void* arg);
 
@@ -89,10 +103,18 @@ esp_err_t audio_player_init(void) {
         ESP_LOGI(TAG, "Using existing BSP audio I2S handle");
     }
 
-    bsp_audio_set_amplifier(true);
+    // Seed headphone state from the BSP so the very first amp_set() call
+    // below already knows whether headphones are plugged in.
+    bool hp_state = false;
+    if (bsp_input_read_action(BSP_INPUT_ACTION_TYPE_AUDIO_JACK, &hp_state) == ESP_OK) {
+        headphones_connected = hp_state;
+    }
+
+    amp_set(true);
     bsp_audio_set_volume(100.0f);
 
-    ESP_LOGI(TAG, "Audio player initialized");
+    ESP_LOGI(TAG, "Audio player initialized (headphones %s)",
+             headphones_connected ? "connected" : "disconnected");
     return ESP_OK;
 }
 
@@ -119,7 +141,7 @@ esp_err_t audio_player_start(void) {
 
     xSemaphoreGive(audio_mutex);
 
-    bsp_audio_set_amplifier(true);
+    amp_set(true);
 
     // Re-enable the I2S channel (stop() disables it to silence the DAC).
     // Ignore ESP_ERR_INVALID_STATE, which just means it is already enabled
@@ -219,7 +241,7 @@ void audio_player_stop(void) {
         i2s_channel_disable(i2s_tx_handle);
     }
 
-    bsp_audio_set_amplifier(false);
+    amp_set(false);
 }
 
 void audio_player_pause(bool pause) {
@@ -241,6 +263,17 @@ uint32_t audio_player_get_position_ms(void) {
     return (uint32_t)((samples_written * 1000ULL) / actual_sample_rate);
 }
 
+void audio_player_set_headphones_connected(bool connected) {
+    if (headphones_connected == connected) return;
+    headphones_connected = connected;
+    ESP_LOGI(TAG, "Headphones %s", connected ? "connected" : "disconnected");
+    // Re-apply the amp state so the speaker follows the new jack state.
+    // On newer coprocessor firmware the coprocessor has already done this
+    // itself; the bsp_audio_set_amplifier call is then a harmless no-op
+    // since the requested state matches the current state.
+    amp_set(amp_wanted_on);
+}
+
 void audio_player_set_volume(int volume) {
     if (volume < 0) volume = 0;
     if (volume > 100) volume = 100;
@@ -249,7 +282,7 @@ void audio_player_set_volume(int volume) {
 
 void audio_player_deinit(void) {
     audio_player_stop();
-    bsp_audio_set_amplifier(false);
+    amp_set(false);
 
     if (audio_mutex) {
         vSemaphoreDelete(audio_mutex);

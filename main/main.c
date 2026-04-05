@@ -776,7 +776,20 @@ void app_main(void) {
                     }
                 }
             } else if (event.type == INPUT_EVENT_TYPE_ACTION) {
-                bsp_device_restart_to_launcher();
+                // Only the power button should exit back to the launcher.
+                // Other action events (SD card insert/remove, audio jack
+                // plug/unplug, etc.) must be ignored, otherwise plugging in
+                // headphones would kick the user out of playback.
+                if (event.args_action.type == BSP_INPUT_ACTION_TYPE_POWER_BUTTON &&
+                    event.args_action.state) {
+                    bsp_device_restart_to_launcher();
+                } else if (event.args_action.type == BSP_INPUT_ACTION_TYPE_AUDIO_JACK) {
+                    // Backward-compat with older coprocessor firmwares that
+                    // don't auto-disable the built-in speaker amp on
+                    // headphone insertion. The audio player tracks the
+                    // state and toggles the amp accordingly.
+                    audio_player_set_headphones_connected(event.args_action.state);
+                }
             }
         }
 

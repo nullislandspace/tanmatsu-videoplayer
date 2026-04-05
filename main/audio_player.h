@@ -35,5 +35,13 @@ uint32_t audio_player_get_position_ms(void);
 // Set volume (0-100)
 void audio_player_set_volume(int volume);
 
+// Notify the audio player about headphone jack state changes.
+// When headphones are connected, the built-in speaker amplifier is turned
+// off; when they're disconnected, it's turned back on (if audio is active).
+// On newer coprocessor firmware this is redundant (the coprocessor does
+// it automatically), but we need it for backward compatibility with older
+// firmwares.
+void audio_player_set_headphones_connected(bool connected);
+
 // Deinitialize audio subsystem
 void audio_player_deinit(void);
