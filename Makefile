@@ -69,6 +69,22 @@ install:
 run:
 	cd badgelink/tools; ./badgelink.sh $(BADGELINK_CONN) start application
 
+# App repository
+
+APP_SLUG_NAME ?= at.cavac.zoetrope
+APP_REPO_PATH ?= ../tanmatsu-app-repository/$(APP_SLUG_NAME)
+
+.PHONY: apprepo
+apprepo: build
+	@echo "=== Updating app repository ==="
+	mkdir -p $(APP_REPO_PATH)
+	cp metadata/metadata.json $(APP_REPO_PATH)/metadata.json
+	cp metadata/icon16.png $(APP_REPO_PATH)/icon16.png
+	cp metadata/icon32.png $(APP_REPO_PATH)/icon32.png
+	cp metadata/icon64.png $(APP_REPO_PATH)/icon64.png
+	cp $(BUILD)/application.bin $(APP_REPO_PATH)/application.bin
+	@echo "=== App repository updated at $(APP_REPO_PATH) ==="
+
 # Preparation
 
 .PHONY: prepare
