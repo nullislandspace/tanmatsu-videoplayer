@@ -121,6 +121,13 @@ esp_err_t audio_player_start(void) {
 
     bsp_audio_set_amplifier(true);
 
+    // Re-enable the I2S channel (stop() disables it to silence the DAC).
+    // Ignore ESP_ERR_INVALID_STATE, which just means it is already enabled
+    // on the very first start after init.
+    if (i2s_tx_handle) {
+        i2s_channel_enable(i2s_tx_handle);
+    }
+
     // Create audio task on Core 1
     BaseType_t result = xTaskCreatePinnedToCore(
         audio_task,
@@ -199,7 +206,9 @@ void audio_player_stop(void) {
         audio_queue = NULL;
     }
 
-    // Flush I2S with silence
+    // Flush I2S with silence, then disable the channel so the DMA stops
+    // looping its last buffer (otherwise the DAC/I2S chip keeps replaying
+    // the same sample even though the amplifier is off).
     if (i2s_tx_handle) {
         memset(pcm_buffer, 0, PCM_BUFFER_SIZE);
         size_t bytes_written = 0;
@@ -207,6 +216,7 @@ void audio_player_stop(void) {
             i2s_channel_write(i2s_tx_handle, pcm_buffer, PCM_BUFFER_SIZE,
                               &bytes_written, pdMS_TO_TICKS(20));
         }
+        i2s_channel_disable(i2s_tx_handle);
     }
 
     bsp_audio_set_amplifier(false);
