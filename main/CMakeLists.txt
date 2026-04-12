@@ -10,6 +10,7 @@ idf_component_register(
 		"usb_device.c"
 		"sdcard.c"
 		"fastopen.c"
+		"splash.c"
 	PRIV_REQUIRES
 		esp_lcd
 		badge-bsp

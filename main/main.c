@@ -31,6 +31,7 @@
 #include "avi_parser.h"
 #include "audio_player.h"
 #include "simd_memcpy.h"
+#include "splash.h"
 
 static const char* TAG = "videoplayer";
 
@@ -606,6 +607,9 @@ void app_main(void) {
     usb_initialize();
     gpio_install_isr_service(0);
 
+    // TEMPORARY: delay so "make monitor" can connect before startup messages
+    vTaskDelay(pdMS_TO_TICKS(10000));
+
     // Initialize BSP
     const bsp_configuration_t bsp_configuration = {
         .display = {
@@ -679,6 +683,12 @@ void app_main(void) {
     esp_err_t res = sdcard_init();
     if (res != ESP_OK) {
         show_error("SD card not found. Insert card and reboot.");
+    }
+
+    // Show the branded splash screen (non-fatal if missing).
+    if (app_state != APP_STATE_ERROR) {
+        int bpp = (display_color_format == LCD_COLOR_PIXEL_FORMAT_RGB565) ? 2 : 3;
+        splash_show(fb_pixels, display_h_res, display_v_res, bpp);
     }
 
     // Initialize audio
