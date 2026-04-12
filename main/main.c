@@ -607,8 +607,8 @@ void app_main(void) {
     usb_initialize();
     gpio_install_isr_service(0);
 
-    // TEMPORARY: delay so "make monitor" can connect before startup messages
-    vTaskDelay(pdMS_TO_TICKS(10000));
+    // // TEMPORARY: delay so "make monitor" can connect before startup messages
+    // vTaskDelay(pdMS_TO_TICKS(10000));
 
     // Initialize BSP
     const bsp_configuration_t bsp_configuration = {
