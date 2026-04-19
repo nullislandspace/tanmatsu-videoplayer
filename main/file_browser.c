@@ -118,20 +118,30 @@ void fb_scan(file_browser_t* browser) {
 }
 
 void fb_move_up(file_browser_t* browser) {
+    if (browser->entry_count == 0) return;
     if (browser->selected_index > 0) {
         browser->selected_index--;
-        if (browser->selected_index < browser->scroll_offset) {
-            browser->scroll_offset = browser->selected_index;
-        }
+    } else {
+        browser->selected_index = browser->entry_count - 1;
+    }
+    if (browser->selected_index < browser->scroll_offset) {
+        browser->scroll_offset = browser->selected_index;
+    } else if (browser->selected_index >= browser->scroll_offset + VISIBLE_ITEMS) {
+        browser->scroll_offset = browser->selected_index - VISIBLE_ITEMS + 1;
     }
 }
 
 void fb_move_down(file_browser_t* browser) {
+    if (browser->entry_count == 0) return;
     if (browser->selected_index < browser->entry_count - 1) {
         browser->selected_index++;
-        if (browser->selected_index >= browser->scroll_offset + VISIBLE_ITEMS) {
-            browser->scroll_offset = browser->selected_index - VISIBLE_ITEMS + 1;
-        }
+    } else {
+        browser->selected_index = 0;
+    }
+    if (browser->selected_index >= browser->scroll_offset + VISIBLE_ITEMS) {
+        browser->scroll_offset = browser->selected_index - VISIBLE_ITEMS + 1;
+    } else if (browser->selected_index < browser->scroll_offset) {
+        browser->scroll_offset = browser->selected_index;
     }
 }
 
