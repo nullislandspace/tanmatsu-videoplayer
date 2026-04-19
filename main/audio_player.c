@@ -57,6 +57,12 @@ static SemaphoreHandle_t audio_mutex = NULL;
 static int64_t audio_start_time_us = 0;
 static volatile uint32_t actual_sample_rate = AUDIO_SAMPLE_RATE;
 
+// Stream format, discovered from the first decoded MP3 frame. Reset on each
+// start so a mono/22k clip doesn't keep the I2S config from a prior stereo/44k
+// clip.
+static volatile int  audio_channels    = 2;
+static volatile bool audio_format_seen = false;
+
 // PCM buffer in internal SRAM for DMA
 static DRAM_ATTR int16_t pcm_buffer[PCM_BUFFER_SAMPLES * 2] __attribute__((aligned(16)));
 
@@ -137,6 +143,8 @@ esp_err_t audio_player_start(void) {
     audio_stop_requested = false;
     stream_ended = false;
     audio_playing = true;
+    audio_format_seen = false;
+    audio_channels = 2;
     audio_start_time_us = esp_timer_get_time();
 
     xSemaphoreGive(audio_mutex);
@@ -314,10 +322,27 @@ static void audio_task(void* arg) {
         goto cleanup;
     }
 
+    // Accumulator for the raw MP3 bitstream. AVI audio chunks are fixed-size
+    // byte slabs and are NOT frame-aligned: an MP3 frame may span two or more
+    // chunks. Camera recordings (22050 Hz mono, 64 kbps) use ~208-byte chunks
+    // with frames that drift across chunk boundaries. We therefore need a
+    // continuous stream buffer so the decoder can always see a full frame.
+    // 8 KiB easily covers any MP3 frame (max ~1440 B) plus one incoming chunk
+    // (max AUDIO_CHUNK_MAX_SIZE = 4096 B).
+    #define ACCUM_SIZE 8192
+    uint8_t* accum = heap_caps_malloc(ACCUM_SIZE, MALLOC_CAP_DEFAULT);
+    if (!accum) {
+        ESP_LOGE(TAG, "Failed to allocate MP3 accumulator");
+        heap_caps_free(frame_buffer);
+        goto cleanup;
+    }
+    size_t accum_len = 0;
+
     // Diagnostics
     uint32_t chunks_received = 0;
     uint32_t frames_decoded = 0;
     uint32_t frames_errors = 0;
+    uint32_t resync_bytes  = 0;
 
     audio_chunk_t chunk;
 
@@ -329,28 +354,42 @@ static void audio_task(void* arg) {
             continue;
         }
 
-        // Wait for chunk from queue
-        TickType_t wait_time = stream_ended ? 0 : pdMS_TO_TICKS(100);
-        if (xQueueReceive(audio_queue, &chunk, wait_time) != pdTRUE) {
+        // Fill the accumulator from the queue. Only pull when there's room
+        // for a full incoming chunk. Block on the first pull when the buffer
+        // is empty (and the stream hasn't ended) so we don't spin.
+        while (accum_len + AUDIO_CHUNK_MAX_SIZE <= ACCUM_SIZE) {
+            TickType_t wait_time;
+            if (accum_len == 0 && !stream_ended) {
+                wait_time = pdMS_TO_TICKS(100);
+            } else {
+                wait_time = 0;
+            }
+            if (xQueueReceive(audio_queue, &chunk, wait_time) != pdTRUE) {
+                break;
+            }
+            memcpy(accum + accum_len, chunk.data, chunk.size);
+            accum_len += chunk.size;
+            chunks_received++;
+        }
+
+        if (accum_len == 0) {
             if (stream_ended) {
-                // No more chunks and stream ended
                 ESP_LOGI(TAG, "=== AUDIO END: samples=%llu ===", (unsigned long long)samples_written);
-                ESP_LOGI(TAG, "=== AUDIO STATS: chunks=%lu, decoded=%lu, errors=%lu ===",
+                ESP_LOGI(TAG, "=== AUDIO STATS: chunks=%lu, decoded=%lu, errors=%lu, resync=%lu ===",
                          (unsigned long)chunks_received, (unsigned long)frames_decoded,
-                         (unsigned long)frames_errors);
+                         (unsigned long)frames_errors, (unsigned long)resync_bytes);
                 break;
             }
             continue;
         }
 
-        chunks_received++;
-
-        // Decode MP3 chunk - may contain multiple frames
-        size_t consumed = 0;
-        while (consumed < chunk.size && !audio_stop_requested) {
+        // Decode as much as we can from the accumulator.
+        size_t pos = 0;
+        bool   made_progress = false;
+        while (pos < accum_len && !audio_stop_requested) {
             esp_audio_dec_in_raw_t raw = {
-                .buffer = chunk.data + consumed,
-                .len = chunk.size - consumed,
+                .buffer = accum + pos,
+                .len = accum_len - pos,
                 .consumed = 0,
                 .frame_recover = ESP_AUDIO_DEC_RECOVERY_NONE,
             };
@@ -368,47 +407,117 @@ static void audio_task(void* arg) {
             if (ret == ESP_AUDIO_ERR_OK && frame.decoded_size > 0) {
                 frames_decoded++;
 
-                // Log format info once
-                static bool format_logged = false;
-                if (!format_logged) {
+                // Configure I2S from the first decoded frame's format.
+                // AVI's auds/strf header isn't parsed, so the decoder is our
+                // only source of truth for rate/channel count. Camera clips
+                // are 22050 Hz mono, pre-converted clips are 44100 Hz stereo.
+                if (!audio_format_seen) {
                     ESP_LOGI(TAG, "Audio format: %d Hz, %d ch, %d bits",
                              dec_info.sample_rate, dec_info.channel, dec_info.bits_per_sample);
-                    if (dec_info.sample_rate > 0) {
-                        actual_sample_rate = dec_info.sample_rate;
+
+                    uint32_t new_rate = dec_info.sample_rate > 0
+                                            ? (uint32_t)dec_info.sample_rate
+                                            : AUDIO_SAMPLE_RATE;
+                    if (new_rate != actual_sample_rate) {
+                        // reconfig_std_clock requires the channel disabled.
+                        i2s_channel_disable(i2s_tx_handle);
+                        esp_err_t rc = bsp_audio_set_rate(new_rate);
+                        if (rc != ESP_OK) {
+                            ESP_LOGW(TAG, "bsp_audio_set_rate(%lu) failed: %s",
+                                     (unsigned long)new_rate, esp_err_to_name(rc));
+                        }
+                        i2s_channel_enable(i2s_tx_handle);
+                        actual_sample_rate = new_rate;
                     }
-                    format_logged = true;
+
+                    audio_channels = (dec_info.channel == 1) ? 1 : 2;
+                    audio_format_seen = true;
                 }
 
-                // Copy to aligned PCM buffer with 50% volume
-                size_t copy_size = frame.decoded_size;
-                if (copy_size > PCM_BUFFER_SIZE) {
-                    copy_size = PCM_BUFFER_SIZE;
-                }
-
+                // Copy decoded samples to the aligned DMA buffer with 50%
+                // volume. I2S is always stereo 16-bit, so mono sources must
+                // be duplicated to L/R — otherwise mono samples are read as
+                // L/R pairs and playback runs at double speed.
                 int16_t* src = (int16_t*)frame_buffer;
                 int16_t* dst = pcm_buffer;
-                size_t num_samples = copy_size / 2;
-                for (size_t i = 0; i < num_samples; i++) {
-                    dst[i] = src[i] >> 1;
+                size_t   bytes_to_write;
+
+                if (audio_channels == 1) {
+                    size_t num_in = frame.decoded_size / sizeof(int16_t);
+                    size_t max_in = PCM_BUFFER_SIZE / (2 * sizeof(int16_t));
+                    if (num_in > max_in) num_in = max_in;
+                    for (size_t i = 0; i < num_in; i++) {
+                        int16_t s = src[i] >> 1;
+                        dst[i * 2]     = s;
+                        dst[i * 2 + 1] = s;
+                    }
+                    bytes_to_write = num_in * 2 * sizeof(int16_t);
+                } else {
+                    size_t copy_size = frame.decoded_size;
+                    if (copy_size > PCM_BUFFER_SIZE) {
+                        copy_size = PCM_BUFFER_SIZE;
+                    }
+                    size_t num_samples = copy_size / sizeof(int16_t);
+                    for (size_t i = 0; i < num_samples; i++) {
+                        dst[i] = src[i] >> 1;
+                    }
+                    bytes_to_write = copy_size;
                 }
 
                 // Write to I2S
                 size_t bytes_written = 0;
-                i2s_channel_write(i2s_tx_handle, pcm_buffer, copy_size,
+                i2s_channel_write(i2s_tx_handle, pcm_buffer, bytes_to_write,
                                   &bytes_written, portMAX_DELAY);
 
+                // Stereo 16-bit frames are 4 bytes.
                 samples_written += bytes_written / 4;
 
-                consumed += raw.consumed;
+                pos += raw.consumed;
+                made_progress = true;
             } else if (raw.consumed > 0) {
-                // Decoder consumed data but didn't output (partial frame)
-                consumed += raw.consumed;
+                // Partial parse — consumed some bytes (e.g. header) without
+                // emitting a frame. Advance and try again.
+                pos += raw.consumed;
+                made_progress = true;
             } else {
-                // Can't decode more from this chunk
-                if (ret != ESP_AUDIO_ERR_OK) {
-                    frames_errors++;
-                }
+                // Decoder couldn't advance: needs more data OR the current
+                // byte isn't a valid sync. Stop decoding for this pass; if
+                // we have plenty of data buffered the resync scan below will
+                // skip junk bytes.
                 break;
+            }
+        }
+
+        // Compact the accumulator.
+        if (pos > 0) {
+            if (pos < accum_len) {
+                memmove(accum, accum + pos, accum_len - pos);
+            }
+            accum_len -= pos;
+        }
+
+        // If we made no progress and the accumulator has more than a frame's
+        // worth of data (and more is unlikely to arrive — the producer would
+        // have filled us by now), the stream is out of sync. Scan forward
+        // for the next MP3 sync word (11 bits: 0xFF followed by a byte with
+        // top 3 bits set).
+        if (!made_progress && accum_len > 2048) {
+            size_t scan = 1;
+            while (scan + 1 < accum_len) {
+                if (accum[scan] == 0xff && (accum[scan + 1] & 0xe0) == 0xe0) {
+                    break;
+                }
+                scan++;
+            }
+            frames_errors++;
+            resync_bytes += scan;
+            if (scan >= accum_len - 1) {
+                // No sync found at all — dump everything and hope the next
+                // batch starts clean.
+                accum_len = 0;
+            } else {
+                memmove(accum, accum + scan, accum_len - scan);
+                accum_len -= scan;
             }
         }
 
@@ -425,6 +534,7 @@ static void audio_task(void* arg) {
         }
     }
 
+    heap_caps_free(accum);
     heap_caps_free(frame_buffer);
 
 cleanup:
