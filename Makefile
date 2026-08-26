@@ -60,14 +60,27 @@ badgelink:
 # Determine badgelink connection argument: --tcp for host:port, --port for serial devices
 BADGELINK_CONN := $(if $(findstring :,$(BADGELINKPORT)),--tcp $(BADGELINKPORT),--port $(BADGELINKPORT))
 
+# AppFS identity. The slug is the KEY under which the app is stored on
+# the badge -- uploading two different apps under the same slug replaces
+# one with the other, which is exactly what happened while every project
+# generated from this Makefile shipped the literal slug "application".
+# The title is only what the launcher displays and does not
+# disambiguate.
+#
+# The slug is deliberately the same name the app repository publishes
+# under (APP_SLUG_NAME, defined further down): a dev upload should
+# replace the installed copy of THIS app rather than sit beside it as a
+# duplicate, and reusing one name keeps the two from drifting apart.
+APPFS_SLUG  ?= $(APP_SLUG_NAME)
+APPFS_TITLE ?= Video Player
+
 .PHONY: install
 install: build
-install:
-	cd badgelink/tools; ./badgelink.sh $(BADGELINK_CONN) appfs upload application "video player" 0 ../../$(BUILD)/application.bin
+	cd badgelink/tools; ./badgelink.sh $(BADGELINK_CONN) appfs upload $(APPFS_SLUG) "$(APPFS_TITLE)" 0 ../../$(BUILD)/application.bin
 
 .PHONY: run
 run:
-	cd badgelink/tools; ./badgelink.sh $(BADGELINK_CONN) start application
+	cd badgelink/tools; ./badgelink.sh $(BADGELINK_CONN) start $(APPFS_SLUG)
 
 # App repository
 
