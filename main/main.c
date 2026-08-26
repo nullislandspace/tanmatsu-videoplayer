@@ -72,7 +72,12 @@ static avi_codec_t active_codec = AVI_CODEC_UNKNOWN;
 static int current_frame = 0;
 static bool video_ended = false;
 static int video_fps = 20;
-static int frame_duration_ms = 50;
+// Microseconds, not milliseconds. 1000/fps truncates badly at the rates
+// a sparse timeline uses: a 60 fps file gives 16 ms instead of 16.667,
+// a clock running 4% fast, which is nearly 2.5 seconds of invented drift
+// across a one-minute clip -- more than enough on its own to make the
+// player think it is permanently behind and start dropping frames.
+static int64_t frame_duration_us = 50000;
 
 // Video frame ring buffer in PSRAM
 #define VIDEO_BUFFER_FRAMES  16
@@ -91,6 +96,9 @@ static int video_read_idx = 0;
 static int video_buffered = 0;
 static int next_frame_index = 0;
 static bool end_of_file = false;
+// Cleared whenever the decoder is (re)started or the stream is
+// repositioned; set once it has produced a picture. See the skip loop.
+static bool decoder_primed = false;
 
 // Pending audio chunk
 static uint8_t pending_audio_data[4096] __attribute__((aligned(16)));
@@ -129,6 +137,21 @@ static uint32_t timing_frame_count = 0;
 #define SEEK_SMALL   10
 #define SEEK_MEDIUM  60
 #define SEEK_LARGE   600
+
+// Clear the whole framebuffer to opaque black.
+//
+// pax_background(&fb, 0) does NOT do this: PAX colours are ARGB8888 and
+// 0x00000000 is fully TRANSPARENT black, so the fill composites to
+// nothing and leaves whatever the buffer already held -- the splash
+// screen, or uninitialised PSRAM, which reads as a blue-ish wash. Only
+// the video block is painted afterwards, so that leftover is exactly
+// what shows in the letterbox bars. memset is unambiguous for both the
+// RGB565 and RGB888 buffer formats.
+static void clear_framebuffer(void) {
+    uint8_t* px = (uint8_t*)pax_buf_get_pixels_rw(&fb);
+    size_t   bpp = pax_buf_get_type(&fb) == PAX_BUF_16_565RGB ? 2 : 3;
+    memset(px, 0, (size_t)display_h_res * display_v_res * bpp);
+}
 
 void blit(void) {
     bsp_display_blit(0, 0, display_h_res, display_v_res, pax_buf_get_pixels(&fb));
@@ -188,6 +211,18 @@ static int buffer_one_chunk(void) {
     }
 
     if (chunk.type == AVI_CHUNK_VIDEO) {
+        // A zero-length 00dc chunk is AVI's "no new picture in this
+        // slot, keep showing the last one" convention -- a recorder
+        // whose real frame rate is lower than the file's timeline rate
+        // pads with these. Advance the slot number so the timeline
+        // stays aligned, but do not give it a ring-buffer slot: there
+        // is nothing to decode, and buffering it would both waste the
+        // slot and stall the display loop, since a failed decode never
+        // advances current_frame.
+        if (chunk.size == 0) {
+            next_frame_index++;
+            return 0;
+        }
         if (chunk.size > VIDEO_FRAME_MAX_SIZE) {
             ESP_LOGW(TAG, "Video frame too large: %zu, skipping", chunk.size);
             next_frame_index++;
@@ -224,6 +259,7 @@ static int prebuffer_chunks(void) {
 }
 
 static void reset_buffer_state(void) {
+    decoder_primed = false;
     video_write_idx = 0;
     video_read_idx = 0;
     video_buffered = 0;
@@ -292,12 +328,8 @@ static bool process_video_frame(uint8_t* fb_pixels, int fb_stride, int fb_height
     }
 
     // Calculate expected frame from wall clock (accounting for pause)
-    uint32_t elapsed_ms = (uint32_t)((esp_timer_get_time() - playback_start_time_us - total_pause_duration_us) / 1000);
-    int expected_frame = (int)(elapsed_ms / frame_duration_ms);
-
-    if (current_frame > expected_frame) {
-        return false;  // Ahead of schedule
-    }
+    int64_t elapsed_us = esp_timer_get_time() - playback_start_time_us - total_pause_duration_us;
+    int expected_frame = (int)(elapsed_us / frame_duration_us);
 
     if (video_buffered == 0) {
         return false;  // No frames ready
@@ -306,10 +338,38 @@ static bool process_video_frame(uint8_t* fb_pixels, int fb_stride, int fb_height
     buffered_frame_t* frame = &video_frames[video_read_idx];
     uint8_t* frame_data = video_buffer_slot(video_read_idx);
 
-    // Skip frames if behind
+    // Ahead of schedule. This asks whether the next frame's OWN slot has
+    // come round yet, rather than whether the clock has passed the last
+    // frame we drew. On a sparse timeline the two differ: a picture
+    // occupies every slot from its own up to the next real frame's, so
+    // "we are past current_frame" is true for most of a frame's life on
+    // screen and would fetch the successor far too early.
+    if (frame->frame_index > expected_frame) {
+        return false;
+    }
+
+    // Behind schedule: give up on a frame only once its SUCCESSOR is
+    // already due. The old test dropped any frame whose slot lay in the
+    // past, which on a sparse timeline is a frame that still has four
+    // more slots to run -- so it discarded almost every picture in the
+    // file. Each discarded P-frame also breaks the reference chain for
+    // everything after it until the next keyframe, so over-eager
+    // skipping does not just lose frames, it corrupts the ones it keeps.
+    //
+    // ...but not before the decoder has produced its first picture. Up
+    // to that point it is holding no parameter sets, and the SPS/PPS it
+    // needs ride on the very first frame. Audio is started before
+    // prebuffering, so by the time playback begins the clock is already
+    // the prebuffer's worth of time in -- half a second, thirty slots
+    // -- and catching up means discarding exactly the frames carrying
+    // the headers. That is the "h264bsd param set error" burst: nine
+    // failed frames and a second of garbage until the next IDR. Being
+    // half a second late is much cheaper than starting blind.
     int frames_skipped = 0;
-    while (frame->frame_index < expected_frame && video_buffered > 1) {
-        video_read_idx = (video_read_idx + 1) % VIDEO_BUFFER_FRAMES;
+    while (decoder_primed && video_buffered > 1) {
+        int next_idx = (video_read_idx + 1) % VIDEO_BUFFER_FRAMES;
+        if (video_frames[next_idx].frame_index > expected_frame) break;
+        video_read_idx = next_idx;
         video_buffered--;
         current_frame = frame->frame_index + 1;
         frames_skipped++;
@@ -375,6 +435,7 @@ static bool process_video_frame(uint8_t* fb_pixels, int fb_stride, int fb_height
 
     if (frame_ready) {
         current_frame = frame->frame_index + 1;
+        decoder_primed = true;
 
         // FPS tracking
         update_fps();
@@ -448,7 +509,7 @@ static esp_err_t start_playback(const char* path) {
     }
 
     video_fps = info->fps > 0 ? info->fps : 20;
-    frame_duration_ms = 1000 / video_fps;
+    frame_duration_us = 1000000 / video_fps;
 
     const char* codec_name = info->video_codec == AVI_CODEC_MJPEG ? "MJPEG" :
                               info->video_codec == AVI_CODEC_H264 ? "H.264" : "unknown";
@@ -511,7 +572,7 @@ static esp_err_t start_playback(const char* path) {
     prebuffer_chunks();
 
     // Clear screen to black (for letterbox bars)
-    pax_background(&fb, 0);
+    clear_framebuffer();
     blit();
 
     // Reset pause/timing state
@@ -560,7 +621,9 @@ static void do_seek(int delta_seconds) {
     esp_err_t ret = avi_parser_seek_to_frame(&avi_parser, target_frame, &audio_idx);
     if (ret != ESP_OK) return;
 
-    // Flush video buffer
+    // Flush video buffer. The seek lands on a keyframe, so the decoder
+    // is starting cold again and must not be raced past its headers.
+    decoder_primed = false;
     video_write_idx = 0;
     video_read_idx = 0;
     video_buffered = 0;
@@ -579,13 +642,13 @@ static void do_seek(int delta_seconds) {
     prebuffer_chunks();
 
     // Clear screen for new letterbox position
-    pax_background(&fb, 0);
+    clear_framebuffer();
 
     // Reset timing
     current_frame = target_frame;
     video_ended = false;
-    int64_t video_time_ms = (int64_t)target_frame * frame_duration_ms;
-    playback_start_time_us = esp_timer_get_time() - (video_time_ms * 1000);
+    int64_t video_time_us = (int64_t)target_frame * frame_duration_us;
+    playback_start_time_us = esp_timer_get_time() - video_time_us;
     total_pause_duration_us = 0;
     if (paused) {
         pause_start_us = esp_timer_get_time();
@@ -628,6 +691,9 @@ void app_main(void) {
                                                 &display_color_format, &display_data_endian));
 
     bsp_display_rotation_t display_rotation = bsp_display_get_default_rotation();
+    ESP_LOGI(TAG, "Display: %dx%d, rotation=%d, color_format=%d",
+             (int)display_h_res, (int)display_v_res, (int)display_rotation,
+             (int)display_color_format);
 
     pax_buf_type_t format = PAX_BUF_24_888RGB;
     if (display_color_format == LCD_COLOR_PIXEL_FORMAT_RGB565) {

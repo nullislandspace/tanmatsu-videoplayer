@@ -12,6 +12,8 @@
 //
 // To switch: set USE_PPA_HARDWARE to 0 to force pure software path
 
+#include <math.h>
+
 #include "yuv_convert.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -140,6 +142,30 @@ esp_err_t yuv_convert_init(void) {
     return ESP_OK;
 }
 
+// PPA scaling is fixed point, not integer, and not arbitrary either: the
+// register carries an 8-bit integer part and a 4-bit fraction, and the
+// driver TRUNCATES into it --
+//   scale_int  = (uint32_t)scale;
+//   scale_frag = (uint32_t)(scale * 16) & 15;
+// -- so the hardware step is 1/16 and anything between steps rounds
+// DOWN. Quantise here rather than let the two disagree: the block size
+// and centering offsets below are computed from this value, and if they
+// describe a scale the hardware isn't going to use, the picture comes
+// out a few pixels smaller than the box reserved for it and sits off
+// centre by half the difference. A 640x400 frame asking for 1.2 really
+// gets 1.1875, which is eight rows.
+//
+// The +1/32 nudge before truncating is for the float itself: 480/320
+// and 480/256 land exactly on a step, but a ratio that computes to a
+// hair under one -- 29.99999 instead of 30 -- would otherwise lose a
+// whole 1/16. Half a step is far too small to cross into the next one.
+static inline float ppa_quantize_scale(float scale) {
+    const float step = 1.0f / 16.0f;
+    float q = floorf(scale / step + 0.5f * 0.0625f) * step;
+    if (q < step) q = step;
+    return q;
+}
+
 esp_err_t yuv_to_framebuffer(uint8_t* yuv_in, uint8_t* fb_out,
                               int src_width, int src_height,
                               int visible_width, int visible_height,
@@ -182,6 +208,7 @@ esp_err_t yuv_to_framebuffer(uint8_t* yuv_in, uint8_t* fb_out,
     if (scale > 1.0f && visible_width >= fb_h && visible_height >= fb_w) {
         scale = 1.0f;
     }
+    scale = ppa_quantize_scale(scale);
 
     int out_block_w = (int)(visible_height * scale);
     int out_block_h = (int)(visible_width * scale);
@@ -302,6 +329,7 @@ esp_err_t ppa_to_framebuffer(uint8_t* ppa_in, int ppa_stride,
     if (scale > 1.0f && visible_width >= fb_h && visible_height >= fb_w) {
         scale = 1.0f;
     }
+    scale = ppa_quantize_scale(scale);
 
     int out_block_w = (int)(visible_height * scale);
     int out_block_h = (int)(visible_width * scale);
@@ -316,6 +344,19 @@ esp_err_t ppa_to_framebuffer(uint8_t* ppa_in, int ppa_stride,
     size_t fb_size = (size_t)fb_w * fb_h * 3;
     size_t fb_size_aligned = (fb_size + PPA_CACHE_LINE - 1) & ~(PPA_CACHE_LINE - 1);
     esp_cache_msync(fb_out, fb_size_aligned, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+
+    // One-shot geometry report. Everything about where the picture lands
+    // is derived here, so print the derivation rather than guess at it
+    // from what the screen looks like.
+    static bool logged_geom = false;
+    if (!logged_geom) {
+        logged_geom = true;
+        ESP_LOGI(TAG, "geometry: src %dx%d stride %d -> fb %dx%d, scale %d/16, "
+                      "block %dx%d at (%d,%d)",
+                 visible_width, visible_height, ppa_stride, fb_w, fb_h,
+                 (int)(scale * 16.0f + 0.5f),
+                 out_block_w, out_block_h, offset_x, offset_y);
+    }
 
     int64_t t_ppa_start = esp_timer_get_time();
 
