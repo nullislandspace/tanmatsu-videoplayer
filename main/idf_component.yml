@@ -1,7 +1,9 @@
 dependencies:
   idf: ">=5.5.1"
   badgeteam/badge-bsp: "^0.8.0"
-  robotman2412/pax-gfx:
-    version: "^2.0.6"
-    override_path: "../components/pax-gfx"
-  espressif/esp_audio_codec: ">=2.3.0"
+  robotman2412/pax-gfx: "^2.0.6"
+  # Capped below 2.6: from that version on, the component adds a CMake
+  # chip-revision gate that hard-fails the build with "requires ESP32-P4
+  # chip version >= 3.0". The Tanmatsu is rev v1.3. Without the cap the
+  # component manager resolves the newest release and nothing builds.
+  espressif/esp_audio_codec: ">=2.3.0,<2.6.0"

@@ -121,6 +121,33 @@ esp_err_t video_decoder_decode(uint8_t* nal_data, size_t nal_size,
     return ESP_ERR_NOT_FINISHED;
 }
 
+bool video_decoder_get_visible_size(int* width, int* height) {
+    if (!decoder || !width || !height) return false;
+
+    u32 coded_w = h264bsdPicWidth(decoder) * 16;
+    u32 coded_h = h264bsdPicHeight(decoder) * 16;
+    if (coded_w == 0 || coded_h == 0) return false;
+
+    u32 flag = 0, left = 0, top = 0, crop_w = 0, crop_h = 0;
+    h264bsdCroppingParams(decoder, &flag, &left, &crop_w, &top, &crop_h);
+
+    // Only a top/left-anchored window is useful here: the PPA consumes
+    // a block from the start of the buffer and we have nowhere to put a
+    // left/top offset without re-basing the pointer, which would break
+    // the row stride. Every encoder that merely pads to a macroblock
+    // boundary -- the P4's included -- crops from the right and bottom
+    // only, so this is the case that matters.
+    if (flag && left == 0 && top == 0 &&
+        crop_w > 0 && crop_h > 0 && crop_w <= coded_w && crop_h <= coded_h) {
+        *width  = (int)crop_w;
+        *height = (int)crop_h;
+    } else {
+        *width  = (int)coded_w;
+        *height = (int)coded_h;
+    }
+    return true;
+}
+
 void video_decoder_deinit(void) {
     if (decoder) {
         h264bsdShutdown(decoder);

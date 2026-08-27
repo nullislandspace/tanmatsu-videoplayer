@@ -409,16 +409,34 @@ static bool process_video_frame(uint8_t* fb_pixels, int fb_stride, int fb_height
         video_buffered--;
         if (ret == ESP_OK && yuv_out) {
             int64_t t1 = esp_timer_get_time();
+            // width/height above are whole macroblocks. Get the real
+            // picture size from the stream's cropping window, and fall
+            // back to what the AVI header claims -- our own recorder
+            // writes the true size there (320x200 for the OV9281,
+            // coded as 320x208), whether or not the hardware encoder
+            // bothered to emit an SPS crop for the padding rows.
+            int vis_w = width, vis_h = height;
+            video_decoder_get_visible_size(&vis_w, &vis_h);
+            if (vis_w == width && vis_h == height) {
+                const avi_info_t* vi = avi_parser_get_info(&avi_parser);
+                if (vi && vi->width > 0 && vi->height > 0 &&
+                    (int)vi->width <= width && (int)vi->height <= height) {
+                    vis_w = (int)vi->width;
+                    vis_h = (int)vi->height;
+                }
+            }
+            esp_err_t cvt = ESP_ERR_NOT_SUPPORTED;
             if (ppa_out && ppa_stride > 0) {
                 // Use PPA-packed buffer directly from decoder (skip I420→PPA reformat)
-                ppa_to_framebuffer(ppa_out, ppa_stride, fb_pixels,
-                                   width, height, 800, 480);
-            } else {
+                cvt = ppa_to_framebuffer(ppa_out, ppa_stride, fb_pixels,
+                                         width, height, vis_w, vis_h, 800, 480);
+            }
+            if (cvt != ESP_OK) {
                 // Fallback: I420 path with reformat
                 int aligned_w = (width + 15) & ~15;
                 int aligned_h = (height + 15) & ~15;
                 yuv_to_framebuffer(yuv_out, fb_pixels, aligned_w, aligned_h,
-                                   width, height, 800, 480);
+                                   vis_w, vis_h, 800, 480);
             }
             timing_decode_us += (t1 - t0);
             timing_copy_us += (esp_timer_get_time() - t1);

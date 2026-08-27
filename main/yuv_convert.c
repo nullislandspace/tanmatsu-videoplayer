@@ -142,28 +142,150 @@ esp_err_t yuv_convert_init(void) {
     return ESP_OK;
 }
 
-// PPA scaling is fixed point, not integer, and not arbitrary either: the
-// register carries an 8-bit integer part and a 4-bit fraction, and the
-// driver TRUNCATES into it --
-//   scale_int  = (uint32_t)scale;
-//   scale_frag = (uint32_t)(scale * 16) & 15;
-// -- so the hardware step is 1/16 and anything between steps rounds
-// DOWN. Quantise here rather than let the two disagree: the block size
-// and centering offsets below are computed from this value, and if they
-// describe a scale the hardware isn't going to use, the picture comes
-// out a few pixels smaller than the box reserved for it and sits off
-// centre by half the difference. A 640x400 frame asking for 1.2 really
-// gets 1.1875, which is eight rows.
+// --- Output geometry ---------------------------------------------------------
 //
-// The +1/32 nudge before truncating is for the float itself: 480/320
-// and 480/256 land exactly on a step, but a ratio that computes to a
-// hair under one -- 29.99999 instead of 30 -- would otherwise lose a
-// whole 1/16. Half a step is far too small to cross into the next one.
-static inline float ppa_quantize_scale(float scale) {
-    const float step = 1.0f / 16.0f;
-    float q = floorf(scale / step + 0.5f * 0.0625f) * step;
-    if (q < step) q = step;
-    return q;
+// The PPA scale registers carry a 4-bit fraction, so the hardware can
+// only express n/16, and the driver truncates into them. Quantise here
+// rather than let our offsets and the hardware disagree: the block size
+// and centering below are derived from this factor, and if they describe
+// a scale the hardware will not use, the picture comes out smaller than
+// the box reserved for it and sits off centre by half the difference.
+//
+// One real constraint applies to the numerator, and it depends on the
+// OUTPUT colour mode. ppa_srm.c does:
+//
+//   if (out.srm_cm == PPA_SRM_COLOR_MODE_YUV420) {
+//       scale_x_frag &= ~1; scale_y_frag &= ~1;
+//   }
+//
+// -- silently, with no error returned. This path outputs RGB888, so it
+// does NOT apply here and any n is fine. It is very much not fine on
+// the camera side, where camera_video_snapshot() outputs YUV420: an odd
+// n there is rounded down a whole step, and that -- not anything in
+// this file -- was the cause of the green block in OV9281 recordings.
+// Those frames arrived with only 320x200 of their 400x250 ever written,
+// the rest left at the zero-init that YUV420 renders as green. See the
+// comment on pick_video_dims() in the camera's video.c.
+//
+// Leave PPA_SCALE_STEP at 1 unless this function ever grows a YUV
+// output mode, in which case it becomes 2:
+//
+//   1   any n/16      correct for RGB888 output  <- WE ARE HERE
+//   2   eighth steps  required if this ever outputs YUV420/YUV422
+#define PPA_SCALE_STEP 1
+
+// A whole-number block scale still leaves the frame edge to worry
+// about: n * block must also be divisible by 16 or the last partial
+// block is dropped. Let the consumed source block shrink by up to
+// this much to find a size where it is. Two rows off 250 costs 0.8%
+// of the picture; refusing to trim would cost a whole scale step.
+#define PPA_TRIM_PERMILLE 20
+
+typedef struct {
+    uint32_t n;                 // scale numerator; the factor is n/16
+    uint32_t block_w, block_h;  // source pixels actually consumed
+    uint32_t out_w, out_h;      // output block, after the 270 rotation
+    uint32_t off_x, off_y;      // where it lands in the output picture
+    bool     exact;             // n*block divisible by 16 on both axes
+} ppa_geom_t;
+
+// Largest n with (n/16) * block still inside the output picture. The
+// rotation is 270 degrees, so the source width drives the output
+// height and the source height drives the output width -- the same
+// swap ppa_do_scale_rotate_mirror() applies when it bounds-checks us.
+static inline uint32_t ppa_fit_n(uint32_t bw, uint32_t bh,
+                                 uint32_t fb_w, uint32_t fb_h) {
+    uint32_t nx = (16u * fb_h) / bw;
+    uint32_t ny = (16u * fb_w) / bh;
+    return nx < ny ? nx : ny;
+}
+
+static inline bool ppa_n_exact(uint32_t n, uint32_t bw, uint32_t bh) {
+    return ((n * bw) % 16u) == 0u && ((n * bh) % 16u) == 0u;
+}
+
+// Fill in g for a src_w x src_h source landing in an fb_w x fb_h
+// output picture. Prefers the candidate covering the most panel; among
+// equals the search order keeps the least-trimmed one, because the
+// loops start at the untrimmed size and a later candidate has to beat
+// the incumbent outright to replace it.
+static void ppa_plan(uint32_t src_w, uint32_t src_h,
+                     uint32_t fb_w, uint32_t fb_h, ppa_geom_t* g) {
+    // YUV420 input: pic/block dimensions and offsets all have to be even.
+    uint32_t w0 = src_w & ~1u;
+    uint32_t h0 = src_h & ~1u;
+    if (w0 < 2u || h0 < 2u) {           // nothing to divide by; caller rejects it
+        memset(g, 0, sizeof(*g));
+        return;
+    }
+    uint32_t w_min = (w0 - w0 * PPA_TRIM_PERMILLE / 1000u) & ~1u;
+    uint32_t h_min = (h0 - h0 * PPA_TRIM_PERMILLE / 1000u) & ~1u;
+    if (w_min < 2u) w_min = 2u;
+    if (h_min < 2u) h_min = 2u;
+
+    ppa_geom_t best = { .n = 0 };
+
+    for (uint32_t bh = h0; bh >= h_min; bh -= 2u) {
+        for (uint32_t bw = w0; bw >= w_min; bw -= 2u) {
+            uint32_t n_fit = ppa_fit_n(bw, bh, fb_w, fb_h);
+            // Down to the nearest scale step the hardware can honour.
+            uint32_t n = (n_fit / PPA_SCALE_STEP) * PPA_SCALE_STEP;
+            if (n < PPA_SCALE_STEP) continue;
+
+            // Then down again to where the frame edge comes out whole.
+            // Exactness of (n*b) % 16 repeats every 16 steps of n, so
+            // one window either finds a match or there is none here.
+            uint32_t n_floor = (n > 16u) ? (n - 16u) : PPA_SCALE_STEP;
+            while (n >= n_floor && !ppa_n_exact(n, bw, bh)) n -= PPA_SCALE_STEP;
+            if (n < n_floor || n < PPA_SCALE_STEP) continue;
+
+            uint32_t ow = n * bh / 16u;   // rotated: source height -> output width
+            uint32_t oh = n * bw / 16u;
+            if (ow == 0u || oh == 0u || ow > fb_w || oh > fb_h) continue;
+            if ((uint64_t)ow * oh <= (uint64_t)best.out_w * best.out_h) continue;
+
+            best.n       = n;
+            best.block_w = bw;
+            best.block_h = bh;
+            best.out_w   = ow;
+            best.out_h   = oh;
+            best.exact   = true;
+        }
+    }
+
+    // Nothing usable in the trim window: the source needs a scale below
+    // one step, or no step lands on a whole frame edge. Show it 1:1 and
+    // centred -- an unscaled picture is always right, just small -- and
+    // clip if it is larger than the panel.
+    if (best.n == 0u) {
+        best.n       = 16u;
+        best.block_w = (w0 < fb_h) ? w0 : (fb_h & ~1u);
+        best.block_h = (h0 < fb_w) ? h0 : (fb_w & ~1u);
+        best.out_w   = best.block_h;
+        best.out_h   = best.block_w;
+        best.exact   = true;
+    }
+
+    best.off_x = ((fb_w - best.out_w) / 2u) & ~1u;
+    best.off_y = ((fb_h - best.out_h) / 2u) & ~1u;
+    *g = best;
+}
+
+// One-shot geometry report, per distinct source size. Everything about
+// where the picture lands is derived above, so print the derivation
+// rather than try to read it back off the screen.
+static void ppa_log_geom(const char* what, uint32_t src_w, uint32_t src_h,
+                         const ppa_geom_t* g) {
+    static uint32_t logged_w = 0, logged_h = 0;
+    if (src_w == logged_w && src_h == logged_h) return;
+    logged_w = src_w;
+    logged_h = src_h;
+    ESP_LOGI(TAG, "%s: src %ux%u -> block %ux%u at %u/16 -> %ux%u at (%u,%u)%s",
+             what, (unsigned)src_w, (unsigned)src_h,
+             (unsigned)g->block_w, (unsigned)g->block_h, (unsigned)g->n,
+             (unsigned)g->out_w, (unsigned)g->out_h,
+             (unsigned)g->off_x, (unsigned)g->off_y,
+             g->exact ? "" : " INEXACT");
 }
 
 esp_err_t yuv_to_framebuffer(uint8_t* yuv_in, uint8_t* fb_out,
@@ -201,26 +323,16 @@ esp_err_t yuv_to_framebuffer(uint8_t* yuv_in, uint8_t* fb_out,
     int fb_w = display_height;  // 480 (physical framebuffer width)
     int fb_h = display_width;   // 800 (physical framebuffer height)
 
-    // Scale to fit display while maintaining aspect ratio
-    float scale_x = (float)fb_h / visible_width;
-    float scale_y = (float)fb_w / visible_height;
-    float scale = (scale_x < scale_y) ? scale_x : scale_y;
-    if (scale > 1.0f && visible_width >= fb_h && visible_height >= fb_w) {
-        scale = 1.0f;
-    }
-    scale = ppa_quantize_scale(scale);
+    ppa_geom_t g;
+    ppa_plan(visible_width, visible_height, fb_w, fb_h, &g);
+    if (g.n == 0) return ESP_ERR_INVALID_SIZE;
+    ppa_log_geom("geometry(i420)", visible_width, visible_height, &g);
 
-    int out_block_w = (int)(visible_height * scale);
-    int out_block_h = (int)(visible_width * scale);
-
-    int offset_x = (fb_w - out_block_w) / 2;
-    int offset_y = (fb_h - out_block_h) / 2;
-    if (offset_x < 0) offset_x = 0;
-    if (offset_y < 0) offset_y = 0;
-
-    // Ensure even offsets for YUV420
-    offset_x &= ~1;
-    offset_y &= ~1;
+    float scale = (float)g.n / 16.0f;
+    int out_block_w = (int)g.out_w;
+    int out_block_h = (int)g.out_h;
+    int offset_x = (int)g.off_x;
+    int offset_y = (int)g.off_y;
 
     size_t fb_size = (size_t)fb_w * fb_h * 3;
     size_t fb_size_aligned = (fb_size + PPA_CACHE_LINE - 1) & ~(PPA_CACHE_LINE - 1);
@@ -231,8 +343,8 @@ esp_err_t yuv_to_framebuffer(uint8_t* yuv_in, uint8_t* fb_out,
             .buffer = ppa_yuv_buf,
             .pic_w = visible_width,
             .pic_h = visible_height,
-            .block_w = visible_width,
-            .block_h = visible_height,
+            .block_w = (uint32_t)g.block_w,
+            .block_h = (uint32_t)g.block_h,
             .block_offset_x = 0,
             .block_offset_y = 0,
             .srm_cm = PPA_SRM_COLOR_MODE_YUV420,
@@ -304,18 +416,28 @@ uint8_t* yuv_convert_get_output_buffer(void) {
     return NULL;  // PPA writes directly to framebuffer
 }
 
+// coded_width/coded_height describe the buffer the decoder handed us --
+// h264bsd always allocates whole macroblocks, so they are the source
+// size rounded up to a multiple of 16. visible_width/visible_height are
+// how much of that is picture; the rest is encoder padding and must not
+// reach the panel. They differ whenever the recording's height is not a
+// multiple of 16, which for our own files means every OV9281 clip
+// (320x200 coded as 320x208) and no OV5647 one (400x320 exactly).
 esp_err_t ppa_to_framebuffer(uint8_t* ppa_in, int ppa_stride,
                               uint8_t* fb_out,
+                              int coded_width, int coded_height,
                               int visible_width, int visible_height,
                               int display_width, int display_height) {
     if (!ppa_client || !ppa_in || !fb_out) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (visible_width  <= 0 || visible_width  > coded_width)  visible_width  = coded_width;
+    if (visible_height <= 0 || visible_height > coded_height) visible_height = coded_height;
 
     last_reformat_us = 0;  // No reformat needed
 
     // Flush PPA input to PSRAM for DMA
-    size_t yuv_packed_size = (size_t)ppa_stride * visible_height;
+    size_t yuv_packed_size = (size_t)ppa_stride * coded_height;
     size_t yuv_aligned = (yuv_packed_size + PPA_CACHE_LINE - 1) & ~(PPA_CACHE_LINE - 1);
     esp_cache_msync(ppa_in, yuv_aligned, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
 
@@ -323,50 +445,28 @@ esp_err_t ppa_to_framebuffer(uint8_t* ppa_in, int ppa_stride,
     int fb_w = display_height;
     int fb_h = display_width;
 
-    float scale_x = (float)fb_h / visible_width;
-    float scale_y = (float)fb_w / visible_height;
-    float scale = (scale_x < scale_y) ? scale_x : scale_y;
-    if (scale > 1.0f && visible_width >= fb_h && visible_height >= fb_w) {
-        scale = 1.0f;
-    }
-    scale = ppa_quantize_scale(scale);
+    ppa_geom_t g;
+    ppa_plan(visible_width, visible_height, fb_w, fb_h, &g);
+    if (g.n == 0) return ESP_ERR_INVALID_SIZE;
+    ppa_log_geom("geometry", visible_width, visible_height, &g);
 
-    int out_block_w = (int)(visible_height * scale);
-    int out_block_h = (int)(visible_width * scale);
-
-    int offset_x = (fb_w - out_block_w) / 2;
-    int offset_y = (fb_h - out_block_h) / 2;
-    if (offset_x < 0) offset_x = 0;
-    if (offset_y < 0) offset_y = 0;
-    offset_x &= ~1;
-    offset_y &= ~1;
+    float scale = (float)g.n / 16.0f;
+    int offset_x = (int)g.off_x;
+    int offset_y = (int)g.off_y;
 
     size_t fb_size = (size_t)fb_w * fb_h * 3;
     size_t fb_size_aligned = (fb_size + PPA_CACHE_LINE - 1) & ~(PPA_CACHE_LINE - 1);
     esp_cache_msync(fb_out, fb_size_aligned, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
-
-    // One-shot geometry report. Everything about where the picture lands
-    // is derived here, so print the derivation rather than guess at it
-    // from what the screen looks like.
-    static bool logged_geom = false;
-    if (!logged_geom) {
-        logged_geom = true;
-        ESP_LOGI(TAG, "geometry: src %dx%d stride %d -> fb %dx%d, scale %d/16, "
-                      "block %dx%d at (%d,%d)",
-                 visible_width, visible_height, ppa_stride, fb_w, fb_h,
-                 (int)(scale * 16.0f + 0.5f),
-                 out_block_w, out_block_h, offset_x, offset_y);
-    }
 
     int64_t t_ppa_start = esp_timer_get_time();
 
     ppa_srm_oper_config_t srm = {
         .in = {
             .buffer = ppa_in,
-            .pic_w = visible_width,
-            .pic_h = visible_height,
-            .block_w = visible_width,
-            .block_h = visible_height,
+            .pic_w = coded_width,
+            .pic_h = coded_height,
+            .block_w = (uint32_t)g.block_w,
+            .block_h = (uint32_t)g.block_h,
             .block_offset_x = 0,
             .block_offset_y = 0,
             .srm_cm = PPA_SRM_COLOR_MODE_YUV420,
@@ -509,6 +609,22 @@ esp_err_t yuv_to_framebuffer(uint8_t* yuv_in, uint8_t* fb_out,
     }
 
     return ESP_OK;
+}
+
+// The decoder's PPA-packed output is useless without the PPA. Say so
+// rather than leave the symbol undefined -- main.c falls back to the
+// I420 path on this error, which is what makes USE_PPA_HARDWARE 0 a
+// switch you can actually flip.
+esp_err_t ppa_to_framebuffer(uint8_t* ppa_in, int ppa_stride,
+                              uint8_t* fb_out,
+                              int coded_width, int coded_height,
+                              int visible_width, int visible_height,
+                              int display_width, int display_height) {
+    (void)ppa_in; (void)ppa_stride; (void)fb_out;
+    (void)coded_width; (void)coded_height;
+    (void)visible_width; (void)visible_height;
+    (void)display_width; (void)display_height;
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
 uint8_t* yuv_convert_get_output_buffer(void) {

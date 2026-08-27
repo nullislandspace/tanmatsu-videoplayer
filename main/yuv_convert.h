@@ -27,8 +27,12 @@ uint8_t* yuv_convert_get_output_buffer(void);
 void yuv_convert_request_dump(void);
 
 // Convert pre-formatted PPA-packed YUV420 to framebuffer (skips I420→PPA reformat)
+// coded_*: the decoder's macroblock-aligned buffer geometry (ppa_stride belongs to it)
+// visible_*: how much of that is picture; the remainder is encoder padding
+// Returns ESP_ERR_NOT_SUPPORTED when built without PPA — use yuv_to_framebuffer.
 esp_err_t ppa_to_framebuffer(uint8_t* ppa_in, int ppa_stride,
                               uint8_t* fb_out,
+                              int coded_width, int coded_height,
                               int visible_width, int visible_height,
                               int display_width, int display_height);
 
