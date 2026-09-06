@@ -7,3 +7,8 @@ dependencies:
   # chip version >= 3.0". The Tanmatsu is rev v1.3. Without the cap the
   # component manager resolves the newest release and nothing builds.
   espressif/esp_audio_codec: ">=2.3.0,<2.6.0"
+  # Pinned to 0.0.3: 0.1.0 removed the .concurrency_semaphore member from
+  # es8156_config_t, which badge-bsp 0.8.0 still sets in
+  # bsp_audio_initialize(). The BSP's own ">=0.0.2" would otherwise
+  # resolve to 0.1.0 and break the build.
+  nicolaielectronics/es8156: "==0.0.3"
